@@ -45,6 +45,12 @@ else
     LDFLAGS_ZSTD := -lzstd
 endif
 
+# Detection architettura per ottimizzazioni SIMD x86
+ARCH := $(shell uname -m)
+ifeq ($(ARCH),x86_64)
+    VEC_FLAGS := -msse4.1 -mavx2
+endif
+
 # Rilevamento automatico LZ4 e Zstd
 LZ4_AVAILABLE  := $(shell pkg-config --exists liblz4  2>/dev/null && echo yes || echo no)
 ZSTD_AVAILABLE := $(shell pkg-config --exists libzstd 2>/dev/null && echo yes || echo no)
@@ -196,6 +202,11 @@ dirs:
 $(LIBRARY): $(ALL_OBJS)
 	@echo "  [AR]  $@"
 	@ar rcs $@ $^
+
+# ── Regola specifica per Quantization (permette x86 in GitHub Actions) ─
+$(BUILD_DIR)/vector/quantization.o: $(SRC_DIR)/vector/quantization.c
+	@echo "  [CC]  $< (Hardware optimized)"
+	@$(CC) $(CFLAGS) $(VEC_FLAGS) -c $< -o $@
 
 # ── Regola generica .c → .o ──────────────────────────────────
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
