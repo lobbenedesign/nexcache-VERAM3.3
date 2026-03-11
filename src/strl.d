@@ -1,1 +1,0 @@
-strl.o: strl.c
