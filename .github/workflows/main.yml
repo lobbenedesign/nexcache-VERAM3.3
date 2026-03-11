@@ -1,0 +1,34 @@
+name: NexCache CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential liblz4-dev libzstd-dev libssl-dev
+
+    - name: Build NexCache
+      run: |
+        make clean
+        make all
+
+    - name: Run Core Tests
+      run: |
+        ./build/test_arena
+        ./build/test_core_v2
+        ./build/test_v4
+
+    - name: Run Advanced Tests
+      run: |
+        ./build/test_advanced
