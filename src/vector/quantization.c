@@ -1,4 +1,3 @@
-#include "simd_config.h"
 #include "quantization.h"
 #include <string.h>
 
@@ -195,9 +194,3 @@ uint32_t nex_vector_hamming_dist(const uint8_t *a, const uint8_t *b, size_t num_
     }
     return dist;
 }
-
-#if defined(__x86_64__) || defined(_M_X64)
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC pop_options
-#endif
-#endif

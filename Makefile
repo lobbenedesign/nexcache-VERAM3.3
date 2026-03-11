@@ -33,6 +33,12 @@ ifdef PROFILE
 CFLAGS += -pg -g
 endif
 
+# Detection architettura per ottimizzazioni SIMD x86
+ARCH := $(shell uname -m)
+ifeq ($(ARCH),x86_64)
+    CFLAGS += -msse4.1 -mavx2
+endif
+
 # Rileva sistema operativo per link flags
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
@@ -43,12 +49,6 @@ else
     LDFLAGS    := -lpthread -lm -lrt
     LDFLAGS_LZ4 := -llz4
     LDFLAGS_ZSTD := -lzstd
-endif
-
-# Detection architettura per ottimizzazioni SIMD x86
-ARCH := $(shell uname -m)
-ifeq ($(ARCH),x86_64)
-    VEC_FLAGS := -msse4.1 -mavx2
 endif
 
 # Rilevamento automatico LZ4 e Zstd
@@ -202,11 +202,6 @@ dirs:
 $(LIBRARY): $(ALL_OBJS)
 	@echo "  [AR]  $@"
 	@ar rcs $@ $^
-
-# ── Regola specifica per Quantization (permette x86 in GitHub Actions) ─
-$(BUILD_DIR)/vector/quantization.o: $(SRC_DIR)/vector/quantization.c
-	@echo "  [CC]  $< (Hardware optimized)"
-	@$(CC) $(CFLAGS) $(VEC_FLAGS) -c $< -o $@
 
 # ── Regola generica .c → .o ──────────────────────────────────
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
