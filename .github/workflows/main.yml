@@ -6,7 +6,6 @@ on:
   pull_request:
     branches: [ main, master ]
 
-# Forza Node.js 24 per tutti gli step per pulire i log
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -24,10 +23,11 @@ jobs:
 
     - name: Build NexCache Core
       run: |
+        # Il Makefile ora gestisce tutto, non servono flag esterne
         make clean
         make all
 
-    - name: Run Core Tests
+    - name: Run Tests
       run: |
         ./build/test_arena
         ./build/test_core_v2

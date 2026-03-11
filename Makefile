@@ -1,19 +1,27 @@
-# NexCache Makefile — v2.5 (Release Official)
+# NexCache Makefile — v2.6 (Gold Release)
 # ============================================================
 CC      ?= gcc
-CFLAGS  += -O3 -std=c11 -Wall -Wextra -pthread -D_GNU_SOURCE \
+
+# Configuriamo le CFLAGS qui, in modo che siano protette
+CFLAGS  := -O3 -std=c11 -Wall -Wextra -pthread -D_GNU_SOURCE \
             -Isrc -Isrc/memory -Isrc/core -Isrc/vector -Isrc/hashtable \
             -Isrc/segcache -Isrc/crdt -Isrc/bloom -Isrc/network -Isrc/security
 
 UNAME_S := $(shell uname -s)
 ARCH    := $(shell uname -m)
 
-LDFLAGS += -lpthread -lm
+LDFLAGS := -lpthread -lm
 ifneq ($(UNAME_S),Darwin)
     LDFLAGS += -lrt
 endif
 
-# Flags SIMD (Haswell safe per GitHub)
+# Forziamo Haswell su sistemi x86_64 (GitHub CI)
+ifeq ($(ARCH),x86_64)
+    CFLAGS += -march=haswell
+endif
+
+# Flags SIMD specifici per quantization.o
+SIMD_FLAGS := 
 ifeq ($(ARCH),x86_64)
     SIMD_FLAGS := -msse4.1 -mavx2 -mfma
 endif
@@ -22,7 +30,6 @@ BUILD_DIR := build
 SRC_DIR   := src
 TEST_DIR  := tests
 
-# --- SELEZIONE MANUALE SORGENTI (Per evitare conflitti di 'main') ---
 SRCS := $(SRC_DIR)/memory/arena.c \
         $(SRC_DIR)/memory/hybrid.c \
         $(SRC_DIR)/memory/arch_probe.c \
@@ -70,7 +77,7 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	@echo "  [CC]  $<"
 	@$(CC) $(CFLAGS) -c $< -o $@
 
-# Test Targets espliciti
+# Test Targets
 tests: $(BUILD_DIR)/test_arena $(BUILD_DIR)/test_core_v2 $(BUILD_DIR)/test_v4
 
 $(BUILD_DIR)/test_%: $(TEST_DIR)/test_%.c $(LIB)
