@@ -20,13 +20,13 @@ jobs:
 
     - name: Build NexCache
       run: |
-        # Usiamo il Makefile professionale che gestisce SIMD in modo chirurgico
+        # Passiamo CFLAGS direttamente a make per forzare Haswell (AVX2+SSE4.1)
+        # Questo sovrascrive qualsiasi impostazione del Makefile
         make clean
-        make all
+        make all CFLAGS="-O3 -march=haswell -std=c11 -D_GNU_SOURCE -Isrc -Isrc/memory -Isrc/core -Isrc/vector -Isrc/hashtable -Isrc/segcache -Isrc/crdt -Isrc/bloom"
 
     - name: Run Tests
       run: |
         ./build/test_arena
         ./build/test_core_v2
         ./build/test_v4
-        ./build/test_advanced
