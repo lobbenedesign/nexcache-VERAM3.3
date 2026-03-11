@@ -100,7 +100,11 @@ QuantizationType nexvec_auto_quantization(const NexVectorCaps *caps,
     return QUANT_FP16; // default sicuro
 }
 
-void nex_vector_quantize_int8(const float *src, int8_t *dst, size_t dim) {
+#if defined(__x86_64__) || defined(_M_X64)
+__attribute__((target("sse4.1,avx2")))
+#endif
+void
+nex_vector_quantize_int8(const float *src, int8_t *dst, size_t dim) {
     /* Mappa [ -1.0, 1.0 ] in [ -127, 127 ] */
     size_t i = 0;
 #if defined(__aarch64__)
@@ -146,7 +150,11 @@ void nex_vector_quantize_binary(const float *src, uint8_t *dst, size_t dim) {
     }
 }
 
-int32_t nex_vector_dot_int8(const int8_t *a, const int8_t *b, size_t dim) {
+#if defined(__x86_64__) || defined(_M_X64)
+__attribute__((target("sse4.1,avx2")))
+#endif
+int32_t
+nex_vector_dot_int8(const int8_t *a, const int8_t *b, size_t dim) {
     int32_t sum = 0;
     size_t i = 0;
 #if defined(__aarch64__)
