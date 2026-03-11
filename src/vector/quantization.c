@@ -1,3 +1,9 @@
+/* Forziamo l'architettura Intel PRIA di ogni inclusione per GitHub Actions */
+#if defined(__x86_64__) || defined(_M_X64)
+#pragma GCC push_options
+#pragma GCC target("sse4.1,avx2")
+#endif
+
 #include "quantization.h"
 #include <string.h>
 
@@ -8,13 +14,6 @@
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #include <cpuid.h>
-#endif
-
-/* 🛡️ Attributi per sbloccare la compilazione Intel su sistemi rigidi (GitHub CI) */
-#if defined(__x86_64__) || defined(_M_X64)
-#define TARGET_INTEL __attribute__((target("sse4.1,avx2")))
-#else
-#define TARGET_INTEL
 #endif
 
 void nexvec_probe_caps(NexVectorCaps *caps) {
@@ -28,7 +27,6 @@ void nexvec_probe_caps(NexVectorCaps *caps) {
 #endif
 }
 
-TARGET_INTEL
 void nex_vector_quantize_int8(const float *src, int8_t *dst, size_t dim) {
     size_t i = 0;
 #if defined(__aarch64__)
@@ -64,7 +62,6 @@ void nex_vector_quantize_int8(const float *src, int8_t *dst, size_t dim) {
     }
 }
 
-TARGET_INTEL
 int32_t nex_vector_dot_int8(const int8_t *a, const int8_t *b, size_t dim) {
     int32_t sum = 0;
     size_t i = 0;
@@ -98,3 +95,7 @@ uint32_t nex_vector_hamming_dist(const uint8_t *a, const uint8_t *b, size_t num_
     for (size_t i = 0; i < num_bytes; i++) dist += __builtin_popcount(a[i] ^ b[i]);
     return dist;
 }
+
+#if defined(__x86_64__) || defined(_M_X64)
+#pragma GCC pop_options
+#endif
