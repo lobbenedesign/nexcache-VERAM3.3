@@ -43,7 +43,7 @@ dirs:
 	@mkdir -p $(BUILD_DIR)/memory $(BUILD_DIR)/core $(BUILD_DIR)/vector \
 	           $(BUILD_DIR)/hashtable $(BUILD_DIR)/segcache $(BUILD_DIR)/crdt $(BUILD_DIR)/bloom
 
-$(LIB): $(ALL_OBJS)
+$(LIB): $(OBJS)
 	@echo "  [AR]  $@"
 	@ar rcs $@ $(OBJS)
 
