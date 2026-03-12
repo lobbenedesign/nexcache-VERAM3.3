@@ -1,0 +1,31 @@
+name: NexCache CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential pkg-config tcl8.6 tclx libssl-dev
+
+    - name: Build NexCache
+      run: make -j$(nproc)
+
+    - name: Run Core Tests
+      run: ./runtest --verbose --tags -slow --dump-logs
+
+    - name: Verify Executables
+      run: |
+        ls -l src/nexcache-server
+        ls -l src/nexcache-cli
+        ./src/nexcache-server --version
