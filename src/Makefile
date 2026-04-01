@@ -36,7 +36,7 @@ DEPENDENCY_TARGETS=libnexcache linenoise hdr_histogram fpconv
 NODEPS:=clean distclean
 
 # Default settings
-STD=-pedantic
+STD=-pedantic -D_GNU_SOURCE -D__USE_GNU
 
 # Use -Wno-c11-extensions on clang, either where explicitly used or on
 # platforms we can assume it's being used.
