@@ -737,7 +737,7 @@ void moduleReleaseTempClient(client *c) {
     c->duration = 0;
     resetClient(c);
     c->bufpos = 0;
-    c->raw_flag = 0;
+    memset(&c->flag, 0, sizeof(c->flag));
     c->flag.module = 1;
     c->flag.fake = 1;
     c->user = NULL; /* Root user */

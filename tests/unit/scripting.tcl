@@ -1227,7 +1227,7 @@ start_server {tags {"scripting"}} {
     } {*Script attempted to access nonexistent global variable 'print'*}
 }
 
-start_server {tags {"scripting external:skip large-memory"}} {
+start_server {tags {"scripting external:skip"}} {
     test {EVAL - JSON string encoding a string larger than 2GB} {
         run_script {
             local s = string.rep("a", 750 * 1024 * 1024)
@@ -1236,7 +1236,7 @@ start_server {tags {"scripting external:skip large-memory"}} {
     } {2359296002} ;# length includes two double quotes at both ends
 }
 
-start_server {tags {"scripting external:skip large-memory"}} {
+start_server {tags {"scripting external:skip"}} {
     test {EVAL - Test long escape sequences for strings} {
         r eval {
             -- Generate 1gb '==...==' separator

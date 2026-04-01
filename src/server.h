@@ -1380,10 +1380,8 @@ typedef struct client {
     int original_argc;          /* Num of arguments of original command if arguments were rewritten. */
     robj **original_argv;       /* Arguments of original command if arguments were rewritten. */
     /* Client flags and state indicators */
-    union {
-        unsigned __int128 raw_flag;
-        struct ClientFlags flag;
-    };
+    /* Client flags and state indicators */
+    struct ClientFlags flag;
     uint16_t write_flags;            /* Client Write flags - used to communicate the client write state. */
     volatile uint8_t io_read_state;  /* Indicate the IO read state of the client */
     volatile uint8_t io_write_state; /* Indicate the IO write state of the client */
