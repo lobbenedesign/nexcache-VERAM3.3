@@ -1257,7 +1257,7 @@ start_server {tags {"scripting external:skip"}} {
     } {1}
 }
 
-start_server {tags {"scripting external:skip large-memory"}} {
+start_server {tags {"scripting external:skip"}} {
     test {EVAL - Lua can parse string with too many new lines} {
         # Create a long string consisting only of newline characters. When Lua
         # fails to parse a string, it typically includes a snippet like

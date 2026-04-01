@@ -158,7 +158,7 @@ struct NexCacheModule;
 #define RDB_EOF_MARK_SIZE 40
 #define CONFIG_REPL_BACKLOG_MIN_SIZE (1024 * 16) /* 16k */
 #define CONFIG_BGSAVE_RETRY_DELAY 5              /* Wait a few secs before trying again. */
-#define CONFIG_DEFAULT_PID_FILE "/var/run/nexcache.pid"
+#define CONFIG_DEFAULT_PID_FILE "nexcache.pid"
 #define CONFIG_DEFAULT_BINDADDR_COUNT 2
 #define CONFIG_DEFAULT_BINDADDR {"*", "-::*"}
 #define CONFIG_BINDADDR_MAX 16
