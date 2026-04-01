@@ -3362,10 +3362,11 @@ void parseInlineBuffer(client *c) {
     int is_replicated = c->read_flags & READ_FLAGS_REPLICATED;
 
     /* Search for end of line */
-    /* NEX-VERA: SVE2 Hyper-Parser Path */
+/* NEX-VERA: Temporarily disabled for CI debugging
 #ifdef __ARM_FEATURE_SVE
     newline = (char*)vera_sve2_find_delimiter(c->querybuf + c->qb_pos, sdslen(c->querybuf) - c->qb_pos);
-#endif
+#endif 
+*/
     if (!newline) newline = strchr(c->querybuf + c->qb_pos, '\n');
 
     /* Nothing to do without a \r\n */
