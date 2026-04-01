@@ -288,6 +288,11 @@ NexEngine *engine_create(int num_workers, int port, const char *bind_addr) {
         /* Inizializza MPSC queue (Flow-GODMODE) */
         mpsc_init(&w->cmd_queue);
 
+        /* Inizializza Scheduler Ring Buffer (Phase 4) */
+        atomic_init(&w->cmd_head, 0);
+        atomic_init(&w->cmd_tail, 0);
+        memset(w->cmd_ring, 0, sizeof(w->cmd_ring));
+
         /* Inizializza stats atomiche */
         atomic_init(&w->cmds_processed, 0);
         atomic_init(&w->bytes_in, 0);

@@ -114,6 +114,12 @@ typedef struct __attribute__((aligned(256))) NexWorker {
      * Sostituisce il ring buffer con una coda di Vyukov scalabile per Rubin. */
     mpsc_queue_t cmd_queue;
 
+    /* NEX-VERA: Scheduler Ring Buffer (Phase 4 - Work Stealing)
+     * Campi necessari per core/scheduler.c */
+    _Atomic uint64_t cmd_head;
+    _Atomic uint64_t cmd_tail;
+    NexCmd *cmd_ring[NEX_CMD_RING_SIZE];
+
     /* Hash table locale per i dati di questo worker
      * Accesso senza lock (un solo writer: questo worker) */
     void *local_dict; /* Puntatore alla dict locale */
