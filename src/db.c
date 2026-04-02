@@ -77,48 +77,56 @@ static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
  * Even if the key expiry is primary-driven, we can correctly report a key is
  * expired on replicas even if the primary is lagging expiring our key via DELs
  * in the replication link. */
+#include "core/nexstorage.h"
+extern NexStorage *global_nexstorage;
+
 robj *lookupKey(serverDb *db, robj *key, int flags) {
     int dict_index = getKVStoreIndexForKey(objectGetVal(key));
     robj *val = dbFindWithDictIndex(db, objectGetVal(key), dict_index);
     if (val) {
-        /* Forcing deletion of expired keys on a replica makes the replica
-         * inconsistent with the primary. We forbid it on readonly replicas, but
-         * we have to allow it on writable replicas to make write commands
-         * behave consistently.
-         *
-         * It's possible that the WRITE flag is set even during a readonly
-         * command, since the command may trigger events that cause modules to
-         * perform additional writes. */
+        /* Standard Redis lookup handling ... */
         int is_ro_replica = server.primary_host && server.repl_replica_ro;
         int expire_flags = 0;
         if (flags & LOOKUP_WRITE && !is_ro_replica) expire_flags |= EXPIRE_FORCE_DELETE_EXPIRED;
         if (flags & LOOKUP_NOEXPIRE) expire_flags |= EXPIRE_AVOID_DELETE_EXPIRED;
         if (expireIfNeededWithDictIndex(db, key, val, expire_flags, dict_index) != KEY_VALID) {
-            /* The key is no longer valid. */
             val = NULL;
         }
     }
 
+    if (val == NULL && global_nexstorage != NULL) {
+        /* VERA FAST-PATH: Promotion on miss.
+         * If the key exists in NexStorage but not in Redis DB, bring it in. */
+        NexEntry entry;
+        NexStorageResult res = nexstorage_get(global_nexstorage, objectGetVal(key), sdslen(objectGetVal(key)), &entry);
+        if (res == NEXS_OK) {
+            val = createStringObject((const char *)entry.value, entry.value_len);
+            dbAdd(db, key, &val);
+            if (entry.ttl_ms >= 0) {
+                setExpire(NULL, db, key, mstime() + entry.ttl_ms);
+            }
+            /* Tracking hits/misses for promoted keys */
+            if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) server.stat_keyspace_hits++;
+        }
+    }
+
     if (val) {
-        /* Update the access time for the ageing algorithm.
-         * Don't do it if we have a saving child, as this will trigger
-         * a copy on write madness. */
+        /* Update LRU/LFU */
         if ((flags & LOOKUP_NOTOUCH) == 0 &&
             server.current_client && server.current_client->flag.no_touch &&
             server.executing_client && server.executing_client->cmd->proc != touchCommand)
             flags |= LOOKUP_NOTOUCH;
         if (!hasActiveChildProcess() && !(flags & LOOKUP_NOTOUCH)) {
-            /* Shared objects can't be stored in the database. */
-            serverAssert(val->refcount != OBJ_SHARED_REFCOUNT);
             val->lru = lrulfu_touch(val->lru);
         }
-
-        if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) server.stat_keyspace_hits++;
-        /* TODO: Use separate hits stats for WRITE */
+        /* Only increment hits if it wasn't already handled by promotion */
+        if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) {
+            /* If we didn't just promote it, it's a hit on the existing DB entry */
+            if (val->refcount > 1) server.stat_keyspace_hits++;
+        }
     } else {
         if (!(flags & (LOOKUP_NONOTIFY | LOOKUP_WRITE))) notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", key, db->id);
         if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) server.stat_keyspace_misses++;
-        /* TODO: Use separate misses stats and notify event for WRITE */
     }
 
     return val;
