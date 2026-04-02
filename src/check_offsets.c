@@ -14,13 +14,13 @@ struct serverObject {
     unsigned hasembkey : 1;
     unsigned hasembval : 1;
     unsigned refcount : OBJ_REFCOUNT_BITS;
-    void *val_ptr;
+    void *ptr;
     char svi_payload[240];
 };
 
 int main() {
     printf("sizeof(robj): %zu\n", sizeof(struct serverObject));
-    printf("offset of val_ptr: %zu\n", offsetof(struct serverObject, val_ptr));
+    printf("offset of ptr: %zu\n", offsetof(struct serverObject, ptr));
     printf("offset of svi_payload: %zu\n", offsetof(struct serverObject, svi_payload));
     return 0;
 }

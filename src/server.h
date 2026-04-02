@@ -829,7 +829,7 @@ typedef struct NexCacheModuleType moduleType;
  *    +------+----------+-----+-----------+-----------+-----------+----------+----
  *
  * The optional variable-sized embedded data has 2 possible layouts. If value is embedded (hasembval == 1)
- *  the `val_ptr` pointer is not used - instead the val data is embedded:
+ *  the `ptr` pointer is not used - instead the val data is embedded:
  *
  *    +------+----------+-----+------------+----------+--------+-----------------+---------+------------+
  *    | type | encoding | lru | has* flags | refcount | expire | key_header_size | key sds | value data |
@@ -842,10 +842,10 @@ typedef struct NexCacheModuleType moduleType;
  *                                                      |
  *                                                      +--- present if hasexpire == 1
  *
- * Otherwise value is not embedded and we use the `val_ptr` pointer:
+ * Otherwise value is not embedded and we use the `ptr` pointer:
  *
  *    +------+----------+-----+------------+----------+---------+--------+-----------------+---------+
- *    | type | encoding | lru | has* flags | refcount | val_ptr | expire | key_header_size | key sds |
+ *    | type | encoding | lru | has* flags | refcount | ptr | expire | key_header_size | key sds |
  *    +------+----------+-----+------------+----------+---------+--------+-----------------+---------+
  *                                                      ^         ^        ^                 ^
  *                                                      |         |        |                 |
@@ -888,7 +888,7 @@ char *getObjectTypeName(robj *);
         _var.hasexpire = 0;                  \
         _var.hasembkey = 0;                  \
         _var.hasembval = 0;                  \
-        _var.val_ptr = _ptr;                 \
+        _var.ptr = _ptr;                 \
     } while (0)
 
 struct evictionPoolEntry; /* Defined in evict.c */
