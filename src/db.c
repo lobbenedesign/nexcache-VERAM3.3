@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "kvstore.h"
 #include "cluster.h"
 #include "cluster_migrateslots.h"
 #include "latency.h"
@@ -1974,8 +1975,18 @@ long long getExpireWithDictIndex(serverDb *db, robj *key, int dict_index) {
 /* Return the expire time of the specified key, or -1 if no expire
  * is associated with this key (i.e. the key is non volatile) */
 long long getExpire(serverDb *db, robj *key) {
-    int dict_index = getKVStoreIndexForKey(objectGetVal(key));
-    return getExpireWithDictIndex(db, key, dict_index);
+    void *expire_ptr = NULL;
+    if (kvstoreHashtableFind(db->expires, getKVStoreIndexForKey(key->ptr), key->ptr, &expire_ptr)) {
+        return (long long)((robj *)expire_ptr)->ptr;
+    }
+
+    if (global_nexstorage) {
+        NexEntry entry;
+        if (nexstorage_get(global_nexstorage, key->ptr, sdslen(key->ptr), &entry) == NEXS_OK) {
+            if (entry.ttl_ms > 0) return mstime() + entry.ttl_ms;
+        }
+    }
+    return -1;
 }
 
 void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int dict_index) {
