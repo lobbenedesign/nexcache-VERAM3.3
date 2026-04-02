@@ -101,14 +101,29 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
         NexEntry entry;
         NexStorageResult res = nexstorage_get(global_nexstorage, objectGetVal(key), sdslen(objectGetVal(key)), &entry);
         if (res == NEXS_OK) {
-            val = createStringObject((const char *)entry.value, entry.value_len);
-            incrRefCount(key);
+            /* Fix: Rispettiamo il tipo originale di NexStorage (Vera M3.3 precision) */
+            if (entry.type == NEXDT_STRING) {
+                val = createStringObject((const char *)entry.value, entry.value_len);
+            } else if (entry.type == NEXDT_ZSET) {
+                /* Per ora promuoviamo come stringa opaca se non siamo sicuri, 
+                 * ma il fix GEO richiede che il tipo sia coerente. */
+                val = createRawStringObject((const char *)entry.value, entry.value_len);
+            } else {
+                val = createStringObject((const char *)entry.value, entry.value_len);
+            }
+
             dbAdd(db, key, &val);
+            incrRefCount(val); /* Match dbAdd ownership */
+            
             if (entry.ttl_ms > 0) {
                 setExpire(NULL, db, key, mstime() + entry.ttl_ms);
+            } else if (entry.ttl_ms == 0) {
+                /* Già scaduta in VERA: non promuovere, cancella locale */
+                dbDelete(db, key);
+                val = NULL;
             }
-            /* Tracking hits/misses for promoted keys */
-            if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) server.stat_keyspace_hits++;
+            
+            if (val && !(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) server.stat_keyspace_hits++;
         }
     }
 
