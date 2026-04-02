@@ -174,17 +174,60 @@ static robj *createEmbeddedStringObjectWithKeyAndExpire(const char *val_ptr,
     o->encoding = OBJ_ENCODING_EMBSTR;
     o->refcount = 1;
     o->hasembval = 1;
+    o->hasexpire = 0;
+    o->hasembkey = 0;
     
+    struct sdshdr8 *sh = (void *)o->svi_payload;
+    sh->len = val_len;
+    sh->alloc = val_len;
+    sh->flags = SDS_TYPE_8;
     if (val_ptr && val_len > 0) {
-        memcpy(o->svi_payload, val_ptr, val_len);
+        memcpy(sh->buf, val_ptr, val_len);
     }
+    sh->buf[val_len] = '\0';
     return o;
 #else
-    /* Calculate sizes ... (existing Redis-style EMBSTR) */
-    // ... (omitted for brevity in replace, but keeping original logic for non-Rubin)
-    // Actually I should keep the original code for fallback.
+    size_t hdr_len = sdsHdrSize(SDS_TYPE_8);
+    int has_embkey = key != NULL;
+    int has_expire = (expire != EXPIRY_NONE);
+    size_t key_sds_len = has_embkey ? sdslen(key) : 0;
+    char key_sds_type = has_embkey ? sdsReqType(key_sds_len) : 0;
+    size_t key_sds_size = has_embkey ? sdsReqSize(key_sds_len, key_sds_type) : 0;
+    
+    size_t size = sizeof(robj) - sizeof(void *) + hdr_len + val_len + 1;
+    if (has_expire) size += sizeof(long long);
+    if (has_embkey) size += 1 + key_sds_size;
+
+    robj *o = zmalloc(size);
+    o->type = OBJ_STRING;
+    o->encoding = OBJ_ENCODING_EMBSTR;
+    o->refcount = 1;
+    o->lru = 0;
+    o->hasembval = 1;
+    o->hasexpire = has_expire;
+    o->hasembkey = has_embkey;
+
+    unsigned char *data = (void *)(o + 1);
+    data -= sizeof(void *); // reuse ptr space
+
+    if (has_expire) {
+        *(long long *)data = expire;
+        data += sizeof(long long);
+    }
+    if (has_embkey) {
+        *data++ = sdsHdrSize(key_sds_type);
+        sdswrite((char *)data, key_sds_size, key_sds_type, key, key_sds_len);
+        data += key_sds_size;
+    }
+
+    struct sdshdr8 *sh = (void *)data;
+    sh->len = val_len;
+    sh->alloc = val_len;
+    sh->flags = SDS_TYPE_8;
+    if (val_ptr && val_len > 0) memcpy(sh->buf, val_ptr, val_len);
+    sh->buf[val_len] = '\0';
+    return o;
 #endif
-    return NULL; // Fallback
 }
 
 /* Create a string object with encoding OBJ_ENCODING_EMBSTR, that is
@@ -198,7 +241,7 @@ static bool shouldEmbedStringObject(size_t val_len, const_sds key, long long exp
 #ifdef RUBIN_MODE
     /* NEX-VERA: Support SVI up to 240 bytes in-situ. */
     if (key || expire != EXPIRY_NONE) return false; // Keep it simple for now: SVI only for pure values
-    return val_len <= 240;
+    return val_len <= (240 - 3 - 1); // 236 bytes max for SVI (payload - sds8_hdr - null)
 #else
     /* When to embed? Embed when the sum is up to 128 bytes. (2 cache lines on most systems) */
     if (val_len > sdsTypeMaxSize(SDS_TYPE_8)) return false;
