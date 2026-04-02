@@ -167,7 +167,7 @@ static robj *createEmbeddedStringObjectWithKeyAndExpire(const char *val_ptr,
                                                         const_sds key,
                                                         long long expire) {
     /* VERA M3.3: Every robj is 256 bytes and has svi_payload[240]. */
-    robj *o = zmalloc(sizeof(robj));
+    robj *o = zcalloc(sizeof(robj));
     o->type = OBJ_STRING;
     o->encoding = OBJ_ENCODING_EMBSTR;
     o->refcount = 1;
