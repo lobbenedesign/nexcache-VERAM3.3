@@ -3355,7 +3355,7 @@ void unprotectClient(client *c) {
  * to be executed inside the client structure.
  * Sets the client read_flags to indicate the parsing outcome. */
 void parseInlineBuffer(client *c) {
-    char *newline;
+    char *newline = NULL; /* MUST be NULL: SVE2 path is #ifdef'd, UB under -O3 otherwise */
     int argc, j, linefeed_chars = 1;
     sds *argv;
     size_t querylen;
