@@ -49,8 +49,8 @@
 /* NEX-VERA: SVE2 Vectorized Detection of RESP Delimiters 
  * Utilizza vera_simd.h per alta velocità su hardware Rubin. */
 static inline const char *vera_sve2_find_delimiter(const char *s, size_t n) {
-    const uint8_t delims[4] = {'\r', '\n', '$', '*'};
-    return vera_find_any(s, n, delims, 4);
+    const uint8_t delims[2] = {'\r', '\n'};
+    return vera_find_any(s, n, delims, 2);
 }
 
 /* NEX-VERA M3.3: Phase 3 - Vyukov Lock-Free MPSC Queue 

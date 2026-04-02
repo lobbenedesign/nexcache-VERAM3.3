@@ -6814,7 +6814,7 @@ void daemonize(void) {
     int fd;
 
     if (nexcache_fork() != 0) exit(0); /* parent exits */
-    setsid();                        /* create a new session */
+    setsid();                          /* create a new session */
 
     /* Every output goes to /dev/null. If the server is daemonized but
      * the 'logfile' is set to 'stdout' in the configuration file

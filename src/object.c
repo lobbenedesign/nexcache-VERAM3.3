@@ -181,7 +181,7 @@ static robj *createEmbeddedStringObjectWithKeyAndExpire(const char *val_ptr,
     
     struct sdshdr8 *sh = (void *)o->svi_payload;
     sh->len = val_len;
-    sh->alloc = val_len;
+    sh->alloc = 236; /* VERA M3.3: Correct SVI payload capacity (240 - 3 hdr - 1 null) */
     sh->flags = SDS_TYPE_8;
     if (val_ptr && val_len > 0) {
         memcpy(sh->buf, val_ptr, val_len);
