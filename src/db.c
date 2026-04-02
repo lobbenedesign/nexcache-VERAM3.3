@@ -101,6 +101,7 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
         NexStorageResult res = nexstorage_get(global_nexstorage, objectGetVal(key), sdslen(objectGetVal(key)), &entry);
         if (res == NEXS_OK) {
             val = createStringObject((const char *)entry.value, entry.value_len);
+            incrRefCount(key);
             dbAdd(db, key, &val);
             if (entry.ttl_ms > 0) {
                 setExpire(NULL, db, key, mstime() + entry.ttl_ms);
