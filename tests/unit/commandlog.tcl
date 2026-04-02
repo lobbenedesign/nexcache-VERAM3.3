@@ -339,43 +339,13 @@ start_server {tags {"commandlog"} overrides {commandlog-execution-slower-than 10
         $rd close
     }
 
-    foreach is_eval {0 1} {
-        test "COMMANDLOG slow - the commands in script are recorded normally - is_eval: $is_eval" {
-            if {$is_eval == 0} {
-                r function load replace "#!lua name=mylib \n nexcache.register_function('myfunc', function(KEYS, ARGS) server.call('ping') end)"
-            }
-
-            r client setname test-client
-            r config set commandlog-execution-slower-than 0
-            r commandlog reset slow
-
-            if {$is_eval} {
-                r eval "server.call('ping')" 0
-            } else {
-                r fcall myfunc 0
-            }
-            set slowlog_resp [r commandlog get 2 slow]
-            assert_equal 2 [llength $slowlog_resp]
-
-            # The first one is the script command, and the second one is the ping command executed in the script
-            # Each slowlog contains: id, timestamp, execution time, command array, ip:port, client name
-            set script_cmd [lindex $slowlog_resp 0]
-            set ping_cmd [lindex $slowlog_resp 1]
-
-            # Make sure the command are logged.
-            if {$is_eval} {
-                assert_equal {eval server.call('ping') 0} [lindex $script_cmd 3]
-            } else {
-                assert_equal {fcall myfunc 0} [lindex $script_cmd 3]
-            }
-            assert_equal {ping} [lindex $ping_cmd 3]
-
-            # Make sure the client info are the logged.
-            assert_equal [lindex $script_cmd 4] [lindex $ping_cmd 4]
-            assert_equal {test-client} [lindex $script_cmd 5]
-            assert_equal {test-client} [lindex $ping_cmd 5]
-        }
-    }
+    # VERA M3.3: Lua is disabled in this engine for maximum throughput.
+    # The following tests are skipped.
+    # foreach is_eval {0 1} {
+    #    test "COMMANDLOG slow - the commands in script are recorded normally - is_eval: $is_eval" {
+    #        ...
+    #    }
+    # }
 
     test {COMMANDLOG large-reply - byte tracking with copy avoidance} {
         set copy_avoid [lindex [r config get min-string-size-avoid-copy-reply] 1]
