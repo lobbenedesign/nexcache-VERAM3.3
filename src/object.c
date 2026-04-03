@@ -49,6 +49,8 @@
  * so if expire is set later, we don't need to reallocate the object. */
 #define KEY_SIZE_TO_INCLUDE_EXPIRE_THRESHOLD 128
 
+static unsigned char *objectEmbeddedData(const robj *o);
+
 /* ===================== Creation and parsing of objects ==================== */
 
 /* Creates an object, optionally with embedded key and expire fields. The key
@@ -98,7 +100,7 @@ static robj *createUnembeddedObjectWithKeyAndExpire(int type, void *val, const_s
     o->hasexpire = has_expire;
 
     /* The memory after the struct where we embedded data. */
-    char *data = (void *)(o + 1);
+    char *data = (char *)objectEmbeddedData(o);
 
     /* Set the expire field. */
     if (o->hasexpire) {
