@@ -914,19 +914,6 @@ extern NexStorage *global_nexstorage;
 void delGenericCommand(client *c, int lazy) {
     int numdel = 0, j;
 
-    if (global_nexstorage) {
-        /* Narrow-waist API routing */
-        for (j = 1; j < c->argc; j++) {
-            robj *key = getDecodedObject(c->argv[j]);
-            NexStorageResult res = nexstorage_del(global_nexstorage, objectGetVal(key), sdslen(objectGetVal(key)));
-            decrRefCount(key);
-            if (res == 0 /* NEXS_OK */) {
-                numdel++;
-            }
-        }
-        addReplyLongLong(c, numdel);
-        return;
-    }
 
     for (j = 1; j < c->argc; j++) {
         if (expireIfNeeded(c->db, c->argv[j], NULL, 0) == KEY_DELETED) continue;
@@ -955,17 +942,6 @@ void existsCommand(client *c) {
     long long count = 0;
     int j;
 
-    if (global_nexstorage) {
-        for (j = 1; j < c->argc; j++) {
-            robj *key = getDecodedObject(c->argv[j]);
-            if (nexstorage_exists(global_nexstorage, objectGetVal(key), sdslen(objectGetVal(key)))) {
-                count++;
-            }
-            decrRefCount(key);
-        }
-        addReplyLongLong(c, count);
-        return;
-    }
 
     for (j = 1; j < c->argc; j++) {
         if (lookupKeyReadWithFlags(c->db, c->argv[j], LOOKUP_NOTOUCH)) count++;
@@ -2004,14 +1980,7 @@ long long getExpire(serverDb *db, robj *key) {
         return (long long)((robj *)expire_ptr)->ptr;
     }
 
-    if (global_nexstorage) {
-        NexEntry entry;
-        if (nexstorage_get(global_nexstorage, key->ptr, sdslen(key->ptr), &entry) == NEXS_OK) {
-            if (entry.ttl_ms == 0) return mstime() - 1; /* Scaduta: forza eliminazione */
-            if (entry.ttl_ms > 0) return mstime() + entry.ttl_ms;
-            return -1; /* Permanente */
-        }
-    }
+
     return -1;
 }
 
