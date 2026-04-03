@@ -101,27 +101,32 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
         NexEntry entry;
         NexStorageResult res = nexstorage_get(global_nexstorage, objectGetVal(key), sdslen(objectGetVal(key)), &entry);
         if (res == NEXS_OK) {
-            /* NEX-VERA: Creazione oggetto con tipo consapevole */
+            /* NEX-VERA: Creazione oggetto con tipo consapevole (Mapping corretto) */
             int type = OBJ_STRING;
-            if (entry.type == 4) type = OBJ_ZSET;      /* NEXDT_ZSET */
-            else if (entry.type == 2) type = OBJ_HASH; /* NEXDT_HASH */
-            else if (entry.type == 1) type = OBJ_LIST; /* NEXDT_LIST */
-            else if (entry.type == 3) type = OBJ_SET;  /* NEXDT_SET */
+            if (entry.type == 1) type = OBJ_HASH;
+            else if (entry.type == 2) type = OBJ_LIST;
+            else if (entry.type == 3) type = OBJ_SET;
+            else if (entry.type == 4) type = OBJ_ZSET;
 
             if (type == OBJ_STRING) {
                 val = createStringObject((const char *)entry.value, entry.value_len);
             } else {
-                /* Per i tipi complessi promuoviamo lo stub per il checkType.
-                 * NOTA: L'integrazione completa dei dati complessi richiede piani di volo specifici. */
+                /* Per i tipi complessi promuoviamo lo stub per il checkType */
                 val = createObject(type, NULL);
             }
 
+            /* NEX-VERA: Protezione codifica chiave (Evita Segfault su chiavi INT) */
+            robj *decoded_key = key;
+            if (key->encoding == OBJ_ENCODING_INT) decoded_key = getDecodedObject(key);
+
             /* NEX-VERA: Promozione silenziosa e atomica per prevenire ricorsioni */
-            int dict_index = getKVStoreIndexForKey(objectGetVal(key));
-            val = objectSetKeyAndExpire(val, objectGetVal(key), -1);
+            int dict_index = getKVStoreIndexForKey(objectGetVal(decoded_key));
+            val = objectSetKeyAndExpire(val, objectGetVal(decoded_key), -1);
             initObjectLRUOrLFU(val);
             kvstoreHashtableAdd(db->keys, dict_index, val);
             incrRefCount(key); /* Mantieni viva la chiave promoted */
+
+            if (decoded_key != key) decrRefCount(decoded_key);
             
             if (entry.ttl_ms > 0) {
                 val = setExpire(NULL, db, key, commandTimeSnapshot() + entry.ttl_ms);
