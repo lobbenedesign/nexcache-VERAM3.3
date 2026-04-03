@@ -33,9 +33,9 @@
 #include "vll.h"
 
 /* ── Costanti engine ────────────────────────────────────────── */
-#define NEX_MAX_WORKERS 176
+#define NEX_MAX_WORKERS 16
 #define NEX_HASH_SLOTS 16384   /* Compatibile NexCache Cluster */
-#define NEX_CMD_RING_SIZE 4096 /* Elementi nel ring buffer (potenza 2) */
+#define NEX_CMD_RING_SIZE 32768 /* Elementi nel ring buffer (potenza 2) */
 #define NEX_CMD_RING_MASK (NEX_CMD_RING_SIZE - 1)
 #define NEX_MAX_CMD_SIZE 1024  /* Dimensione massima un comando */
 #define NEX_MAX_INLINE_ARGS 32 /* Max argomenti inline per comando */

@@ -421,6 +421,6 @@ void setcpuaffinity(const char *cpulist);
 #endif
 
 /* G3-GODMODE: NVIDIA Vera (Rubin) Architecture Constants */
-#define NEX_RCU_SHARDS 176
+#define NEX_RCU_SHARDS 16
 
 #endif

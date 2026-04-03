@@ -142,7 +142,6 @@ struct NexCacheModule;
 #define C_RETRY -2
 
 /* Static server configuration */
-#define NEX_RCU_SHARDS 176      /* NVIDIA Vera (Rubin) Logical Thread count */
 #define CONFIG_DEFAULT_HZ 10 /* Time interrupt calls/sec. */
 #define CONFIG_MIN_HZ 1
 #define CONFIG_MAX_HZ 500

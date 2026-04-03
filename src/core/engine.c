@@ -230,11 +230,8 @@ done:
 
 /* ── Auto-detect core CPU ───────────────────────────────────── */
 int engine_auto_workers(void) {
-    long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
-    if (ncpus <= 0) ncpus = 4;
-    /* Usa 75% dei core — il resto va a I/O thread e sistema */
-    int workers = (int)(ncpus * 3 / 4);
-    return workers < 1 ? 1 : (workers > NEX_MAX_WORKERS ? NEX_MAX_WORKERS : workers);
+    /* Forzato a 8 per Apple Silicon (M-Series) per massime prestazioni */
+    return 8;
 }
 
 /* ── engine_create ──────────────────────────────────────────── */

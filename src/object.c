@@ -186,16 +186,18 @@ static robj *createEmbeddedStringObjectWithKeyAndExpire(const char *ptr,
     }
     if (has_embkey) {
         size_t keylen = sdslen(key);
-        /* Store as length byte + key data + null */
-        *data++ = (uint8_t)keylen;
-        memcpy(data, key, keylen);
-        data += keylen;
-        *data++ = '\0';
+        *data++ = (uint8_t)sdsHdrSize(SDS_TYPE_8);
+        struct sdshdr8 *sk = (void *)data;
+        sk->len = keylen;
+        sk->alloc = keylen;
+        sk->flags = SDS_TYPE_8;
+        memcpy(sk->buf, key, keylen);
+        sk->buf[keylen] = '\0';
+        data += sdsHdrSize(SDS_TYPE_8) + keylen + 1;
     }
 
     struct sdshdr8 *sh = (void *)data;
     sh->len = val_len;
-    sh->alloc = 236; /* Capacity is approx, sh->buf will be used */
     /* Adjust sh->alloc based on remaining space in svi_payload */
     size_t used = data - (unsigned char *)o->svi_payload;
     sh->alloc = (240 - used) - sdsHdrSize(SDS_TYPE_8) - 1;
@@ -256,8 +258,9 @@ void *objectGetVal(const robj *o) {
         unsigned char *data = objectEmbeddedData(o);
         if (o->hasexpire) data += sizeof(long long);
         if (o->hasembkey) {
-            uint8_t keylen = *data++;
-            data += keylen + 1;
+            uint8_t hlen = *data++;
+            struct sdshdr8 *sk = (void *)data;
+            data += hlen + sk->len + 1;
         }
         return data + sdsHdrSize(SDS_TYPE_8);
     } else {
@@ -266,13 +269,11 @@ void *objectGetVal(const robj *o) {
 }
 
 sds objectGetKey(const robj *o) {
-    const unsigned char *data = objectEmbeddedData((robj *)o);
-    if (o->hasexpire) data += sizeof(long long);
     if (o->hasembkey) {
-        uint8_t keylen = *data++;
-        /* Note: SVI key is not an SDS. Return as raw ptr cast to sds is DANGEROUS.
-         * Callers should be updated or a copy returned. For now, NULL to be safe. */
-        return NULL;
+        const unsigned char *data = objectEmbeddedData((robj *)o);
+        if (o->hasexpire) data += sizeof(long long);
+        uint8_t hlen = *data++;
+        return (sds)(data + hlen);
     }
     return NULL;
 }
