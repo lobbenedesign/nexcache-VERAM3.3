@@ -1922,27 +1922,18 @@ void hexpireGenericCommand(client *c, mstime_t basetime, int unit) {
     if (convertExpireArgumentToUnixTime(c, param, basetime, unit, &when) == C_ERR)
         return;
 
-    if (global_nexstorage) {
-        /* Narrow waist API routing per Subkey TTL:
-         * Intercettiamo e rigiriamo verso NexStorage API. */
-        addReplyArrayLen(c, num_fields);
-        long long now = commandTimeSnapshot();
-        sds key_sds = objectGetVal(c->argv[1]);
-        for (i = 0; i < num_fields; i++) {
-            robj *field_obj = c->argv[fields_index + i];
-            sds field_sds = objectGetVal(field_obj);
-            int64_t ttl_ms = when - now;
-            if (ttl_ms < 0) ttl_ms = 0;
-
-            NexStorageResult rs = nexstorage_subkey_expire(global_nexstorage,
-                                                           key_sds, sdslen(key_sds),
-                                                           field_sds, sdslen(field_sds),
-                                                           ttl_ms);
-            addReplyLongLong(c, (rs == NEXS_OK) ? 1 : -2);
-        }
-        return;
-    }
-
+    /* NOTE: this used to intercept and route to nexstorage_subkey_expire()
+     * ("Narrow waist API routing per Subkey TTL") whenever global_nexstorage
+     * was set -- which is unconditionally true in normal operation. But the
+     * backing implementation (ndapi_subkey_expire in core/nexstorage.c) is a
+     * literal no-op stub that always returns NEXS_OK without persisting
+     * anything ("Stub success"), and its read counterpart (ndapi_subkey_ttl)
+     * always returns -1 ("Stub: no expiry") regardless of what was set. That
+     * made HEXPIRE/HPEXPIRE/HEXPIREAT/HPEXPIREAT always lie about success
+     * while never actually setting a readable TTL -- every hashexpire.tcl
+     * test failed this way. The classic hashTypeSetExpire() path below is
+     * complete and already exercised by every other passing hash test
+     * (hash.tcl etc.), so just always use it instead of the dead stub. */
     robj *obj = lookupKeyWrite(c->db, key);
 
     /* Non HASH type return simple error */
@@ -2061,26 +2052,9 @@ void hpersistCommand(client *c) {
 
     robj *hash = lookupKeyWrite(c->db, c->argv[1]);
 
-    if (global_nexstorage) {
-        /* Narrow waist API routing per Subkey TTL (Persist):
-         * Intercettiamo HPERSIST e rigiriamo verso NexStorage API. */
-        addReplyArrayLen(c, num_fields);
-        sds key_sds = objectGetVal(c->argv[1]);
-        for (int i = 0; i < num_fields; i++) {
-            sds field_sds = objectGetVal(c->argv[fields_index + i]);
-            NexStorageResult rs = nexstorage_subkey_expire(global_nexstorage,
-                                                           key_sds, sdslen(key_sds),
-                                                           field_sds, sdslen(field_sds),
-                                                           -1); /* -1 = Persist */
-            if (rs == NEXS_OK) {
-                server.dirty++;
-                addReplyLongLong(c, 1);
-            } else {
-                addReplyLongLong(c, -2);
-            }
-        }
-        return;
-    }
+    /* See the matching NOTE in hexpireGenericCommand: nexstorage_subkey_expire's
+     * backing implementation is a dead no-op stub, so always use the complete
+     * classic hashTypePersist() path below instead of intercepting into it. */
 
     if (checkType(c, hash, OBJ_HASH))
         return;
@@ -2146,28 +2120,10 @@ void httlGenericCommand(client *c, mstime_t basetime, int unit) {
 
     robj *hash = lookupKeyRead(c->db, c->argv[1]);
 
-    if (global_nexstorage) {
-        /* Narrow waist API routing per Subkey TTL (Read):
-         * Intercettiamo HTTL e rigiriamo verso NexStorage API. */
-        addReplyArrayLen(c, num_fields);
-        sds key_sds = objectGetVal(c->argv[1]);
-        for (int i = 0; i < num_fields; i++) {
-            sds field_sds = objectGetVal(c->argv[fields_index + i]);
-            int64_t ttl_ms = nexstorage_subkey_ttl(global_nexstorage,
-                                                   key_sds, sdslen(key_sds),
-                                                   field_sds, sdslen(field_sds));
-            if (ttl_ms == -1) {
-                addReplyLongLong(c, -1);
-            } else if (ttl_ms == -2) {
-                addReplyLongLong(c, -2);
-            } else {
-                long long res = ttl_ms;
-                if (unit == UNIT_SECONDS) res = (res + 500) / 1000;
-                addReplyLongLong(c, res);
-            }
-        }
-        return;
-    }
+    /* See the matching NOTE in hexpireGenericCommand: nexstorage_subkey_ttl's
+     * backing implementation is a dead no-op stub that always returns -1, so
+     * always use the complete classic hashTypeGetExpiry() path below instead
+     * of intercepting into it. */
 
     if (checkType(c, hash, OBJ_HASH)) return;
 
