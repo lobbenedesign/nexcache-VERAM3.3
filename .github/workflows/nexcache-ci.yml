@@ -23,7 +23,15 @@ jobs:
 
     - name: Build NexCache (Rubin M3.3 Mode)
       run: |
-        make -j$(nproc) RUBIN_MODE=1 EXTRA_CFLAGS="-D_GNU_SOURCE"
+        # MALLOC=libc: the Makefile defaults to jemalloc on Linux, but jemalloc
+        # 5.3.0 has a confirmed crash (je_tcache_bin_flush_small SIGSEGV) under
+        # heavy concurrent SET load with this codebase's allocation pattern
+        # (root-caused across ASan/TSan/debug-jemalloc runs in a prior session).
+        # libc is the deliberately-chosen safe default; don't silently re-enable
+        # jemalloc here. It also sidesteps deps/jemalloc/configure being absent
+        # on a clean checkout (jemalloc's own vendored .gitignore excludes the
+        # autotools-generated configure script, and nothing regenerates it).
+        make -j$(nproc) RUBIN_MODE=1 MALLOC=libc EXTRA_CFLAGS="-D_GNU_SOURCE"
       continue-on-error: false
 
     - name: Verify Executables
