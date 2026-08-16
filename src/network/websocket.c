@@ -178,9 +178,18 @@ int ws_handshake(WsConn *conn, const char *request, size_t req_len) {
     if (!key_start) return -1;
 
     key_start += strlen(key_str);
+    /* PRIMA: il loop cercava '\r'/'\n' avanzando da key_start senza mai
+     * controllare di restare dentro request[0..req_len). Una richiesta
+     * HTTP di upgrade malformata/troncata (header "Sec-WebSocket-Key:"
+     * senza CRLF terminale prima della fine del buffer) faceva leggere
+     * fino a 63 byte oltre la fine del buffer allocato dal chiamante
+     * (heap/stack over-read). Ora il limite superiore include anche la
+     * fine reale della richiesta. */
+    const char *req_end = request + req_len;
     char client_key[64] = {0};
     int key_len = 0;
-    while (key_start[key_len] != '\r' && key_start[key_len] != '\n' &&
+    while (key_start + key_len < req_end &&
+           key_start[key_len] != '\r' && key_start[key_len] != '\n' &&
            key_len < 63) {
         client_key[key_len] = key_start[key_len];
         key_len++;
@@ -312,14 +321,36 @@ int ws_read_frame(WsConn *conn, WsFrame *frame) {
     if (!conn || !frame) return -1;
     if (conn->state != WS_STATE_OPEN) return -1;
 
+    /* PRIMA: read_cap era fisso a 65536 byte e non veniva mai fatto
+     * crescere, mentre WS_MAX_PAYLOAD dichiara frame fino a 16MB. Appena
+     * il buffer si riempiva (read_cap - read_len == 0), recv(fd, ..., 0,
+     * ...) ritornava 0, interpretato subito sotto come "connessione
+     * chiusa dal peer" — qualunque frame WS singolo oltre ~64KB (ben
+     * dentro il limite dichiarato) veniva quindi disconnesso invece che
+     * accettato. Ora il buffer cresce fino a WS_MAX_PAYLOAD prima di
+     * leggere, cosa possibile perché il chiamante non tiene puntatori
+     * a read_buf tra una ws_read_frame() e l'altra. */
+    if (conn->read_cap - conn->read_len < 4096 && conn->read_cap < WS_MAX_PAYLOAD) {
+        size_t new_cap = conn->read_cap * 2;
+        if (new_cap > WS_MAX_PAYLOAD + 16) new_cap = WS_MAX_PAYLOAD + 16;
+        uint8_t *nb = (uint8_t *)realloc(conn->read_buf, new_cap);
+        if (nb) {
+            conn->read_buf = nb;
+            conn->read_cap = new_cap;
+        }
+    }
+
     /* Leggi dati disponibili nel buffer */
-    ssize_t n = recv(conn->fd, conn->read_buf + conn->read_len,
-                     conn->read_cap - conn->read_len, MSG_DONTWAIT);
+    ssize_t n = 0;
+    if (conn->read_cap > conn->read_len) {
+        n = recv(conn->fd, conn->read_buf + conn->read_len,
+                 conn->read_cap - conn->read_len, MSG_DONTWAIT);
+    }
     if (n > 0)
         conn->read_len += (size_t)n;
-    else if (n == 0)
-        return -1; /* Connection closed */
-    else if (errno != EAGAIN && errno != EWOULDBLOCK)
+    else if (n == 0 && conn->read_cap > conn->read_len)
+        return -1; /* Connection closed (solo se avevamo davvero provato a leggere) */
+    else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
         return -1;
 
     if (conn->read_len < 2) return 0; /* Serve altro */
@@ -382,22 +413,62 @@ int ws_read_frame(WsConn *conn, WsFrame *frame) {
     return 1; /* Frame completo */
 }
 
+/* Scrive src in dst come stringa JSON escapata (senza virgolette esterne).
+ * PRIMA: error/req_id (e result quando trattato come stringa grezza)
+ * venivano interpolati verbatim in una struttura JSON via snprintf. Un
+ * solo `"` in un messaggio di errore o in un valore di cache echeggiato
+ * come result rompeva la struttura JSON e poteva iniettare campi
+ * arbitrari nella risposta — reachable con dati cache controllati da un
+ * attaccante (ws_process_command può restituire come result un valore
+ * qualunque letto dalla cache). */
+static size_t ws_json_escape(const char *src, char *dst, size_t dst_cap) {
+    size_t o = 0;
+    if (!src) return 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p && o + 6 < dst_cap; p++) {
+        switch (*p) {
+            case '"':  dst[o++] = '\\'; dst[o++] = '"';  break;
+            case '\\': dst[o++] = '\\'; dst[o++] = '\\'; break;
+            case '\n': dst[o++] = '\\'; dst[o++] = 'n';  break;
+            case '\r': dst[o++] = '\\'; dst[o++] = 'r';  break;
+            case '\t': dst[o++] = '\\'; dst[o++] = 't';  break;
+            default:
+                if (*p < 0x20) {
+                    o += (size_t)snprintf(dst + o, dst_cap - o, "\\u%04x", *p);
+                } else {
+                    dst[o++] = (char)*p;
+                }
+        }
+    }
+    dst[o < dst_cap ? o : dst_cap - 1] = '\0';
+    return o;
+}
+
 /* ── ws_send_response ───────────────────────────────────────── */
 int ws_send_response(WsConn *conn, const char *req_id, const char *result, const char *error) {
     if (!conn) return -1;
     char buf[8192];
+    char esc_a[2048], esc_b[2048];
     int len;
     if (error) {
+        ws_json_escape(error, esc_a, sizeof(esc_a));
+        ws_json_escape(req_id, esc_b, sizeof(esc_b));
         len = snprintf(buf, sizeof(buf),
                        "{\"ok\":false,\"error\":\"%s\",\"id\":\"%s\"}",
-                       error, req_id ? req_id : "");
+                       esc_a, esc_b);
     } else {
+        int result_is_json_literal = result && result[0] == '"';
+        if (result && !result_is_json_literal) {
+            /* result grezzo (non già una stringa JSON quotata dal
+             * chiamante): va escapato prima di essere quotato qui. */
+            ws_json_escape(result, esc_a, sizeof(esc_a));
+        }
+        ws_json_escape(req_id, esc_b, sizeof(esc_b));
         len = snprintf(buf, sizeof(buf),
                        "{\"ok\":true,\"result\":%s%s%s,\"id\":\"%s\"}",
-                       result && result[0] == '"' ? "" : "\"",
-                       result ? result : "null",
-                       result && result[0] == '"' ? "" : "\"",
-                       req_id ? req_id : "");
+                       result_is_json_literal ? "" : "\"",
+                       result ? (result_is_json_literal ? result : esc_a) : "null",
+                       result_is_json_literal ? "" : "\"",
+                       esc_b);
     }
     return ws_send_text(conn, buf, (size_t)len);
 }

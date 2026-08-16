@@ -616,7 +616,7 @@ proc start_server {options {code undefined}} {
         dict set config port $port
     }
 
-    set unixsocket [file normalize [format "%s/%s" [dict get $config "dir"] "socket"]]
+    set unixsocket [format "/tmp/nexc-%d-%d.sock" [pid] [clock clicks]]
     dict set config "unixsocket" $unixsocket
 
     # apply overrides from global space and arguments

@@ -38,6 +38,9 @@
 #include "cluster_migrateslots.h"
 #include "eval.h"
 #include "lrulfu.h"
+#include "crdt/crdt.h" /* CRDT_MAX_NODES per il limite di nexcache-node-id */
+
+extern unsigned int g_nexcache_node_id; /* Definita in t_hash.c */
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -3317,6 +3320,8 @@ standardConfig static_configs[] = {
     createIntConfig("cluster-databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.config_databases_cluster, 1, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.port, 6379, INTEGER_CONFIG, NULL, updatePort),                                               /* TCP port. */
     createIntConfig("io-threads", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1, IO_THREADS_MAX_NUM, server.io_threads_num, 1, INTEGER_CONFIG, NULL, updateIOThreads), /* Single threaded by default */
+    createBoolConfig("nex-io-fastpath", NULL, MODIFIABLE_CONFIG, server.nex_io_fastpath, 0, NULL, NULL), /* NEX: Garnet-style GET fast-path in IO threads */
+    createBoolConfig("nex-engine-workers", NULL, IMMUTABLE_CONFIG, server.nex_engine_workers, 0, NULL, NULL), /* NEX: legacy spinning engine workers (parasitic; off) */
     createIntConfig("events-per-io-thread", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.events_per_io_thread, 2, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("min-io-threads-avoid-copy-reply", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_io_threads_copy_avoid, 7, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("min-string-size-avoid-copy-reply", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_string_size_copy_avoid, 16384, INTEGER_CONFIG, NULL, NULL),
@@ -3336,6 +3341,10 @@ standardConfig static_configs[] = {
     createIntConfig("lfu-decay-time", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, lfu_config_decay_time, 1, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("replica-priority", "slave-priority", MODIFIABLE_CONFIG, 0, INT_MAX, server.replica_priority, 100, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("repl-diskless-sync-delay", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.repl_diskless_sync_delay, 5, INTEGER_CONFIG, NULL, NULL),
+    /* Identità nodo per i CRDT multi-master (t_hash.c: GINCR/PNINCR/ORSET/LWW).
+     * PRIMA era hardcoded a 0 in ogni comando, rendendo impossibile
+     * distinguere i contributi di repliche diverse durante un merge. */
+    createUIntConfig("nexcache-node-id", NULL, IMMUTABLE_CONFIG, 0, CRDT_MAX_NODES - 1, g_nexcache_node_id, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("maxmemory-samples", NULL, MODIFIABLE_CONFIG, 1, 64, server.maxmemory_samples, 5, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("maxmemory-eviction-tenacity", NULL, MODIFIABLE_CONFIG, 0, 100, server.maxmemory_eviction_tenacity, 10, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("timeout", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.maxidletime, 0, INTEGER_CONFIG, NULL, NULL), /* Default client timeout: infinite */

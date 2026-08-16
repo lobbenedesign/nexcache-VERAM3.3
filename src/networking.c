@@ -6444,6 +6444,13 @@ int processIOThreadsReadDone(void) {
             continue;
         }
 
+        /* NEX-FASTPATH: the IO thread already produced replies for a prefix
+         * (possibly all) of this client's pipeline. Make sure they get
+         * scheduled for writing even if no command executes on this pass. */
+        if (c->read_flags & READ_FLAGS_FASTPATH_REPLIED) {
+            if (clientHasPendingReplies(c)) putClientInPendingWriteQueue(c);
+        }
+
         if (!(c->read_flags & READ_FLAGS_DONT_PARSE)) {
             parseResult res = handleParseResults(c);
             /* On parse error - stop here. */
@@ -6530,6 +6537,118 @@ void evictClients(void) {
 
 /* IO threads functions */
 
+#include "core/nexstorage.h"
+extern NexStorage *global_nexstorage;
+
+/* NEX-FASTPATH (Garnet-style, reimplemented for this codebase):
+ * execute an eligible prefix of the parsed pipeline directly in the IO thread
+ * against NexStorage, which is safe for concurrent readers. Only plain
+ * GET <key> hits are served here; the first miss or non-eligible command
+ * stops the prefix so ordering within the pipeline is preserved, and the
+ * remaining commands are handed to the main thread untouched.
+ *
+ * The main thread has already granted permission via READ_FLAGS_FASTPATH_OK,
+ * which guarantees exclusive ownership of the client's reply buffer. */
+/* Append one bulk-string reply for a NexStorage string hit. Returns 0 if the
+ * key misses, is not a plain string, or the reply buffer lacks room. */
+static int nexFastPathEmitBulk(client *c, robj *keyobj) {
+    if (keyobj->encoding != OBJ_ENCODING_RAW && keyobj->encoding != OBJ_ENCODING_EMBSTR) return 0;
+    sds key = objectGetVal(keyobj);
+
+    NexEntry entry;
+    if (nexstorage_get(global_nexstorage, key, (uint32_t)sdslen(key), &entry) != NEXS_OK) return 0;
+    if (entry.type != NEXDT_STRING) return 0;
+
+    char hdr[32];
+    int hl = snprintf(hdr, sizeof(hdr), "$%u\r\n", (unsigned)entry.value_len);
+    size_t need = (size_t)hl + entry.value_len + 2;
+    if ((size_t)c->bufpos + need > c->buf_usable_size) return 0;
+
+    memcpy(c->buf + c->bufpos, hdr, hl);
+    memcpy(c->buf + c->bufpos + hl, entry.value, entry.value_len);
+    memcpy(c->buf + c->bufpos + hl + entry.value_len, "\r\n", 2);
+    c->bufpos += (int)need;
+    return 1;
+}
+
+static int nexFastPathTryCurrent(client *c) {
+    if (c->parsed_cmd == NULL) return 0;
+    if (c->read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY)) return 0;
+
+    /* PING (no argument): pure network round-trip, no state touched. */
+    if (c->parsed_cmd->proc == pingCommand && c->argc == 1) {
+        if ((size_t)c->bufpos + 7 > c->buf_usable_size) return 0;
+        memcpy(c->buf + c->bufpos, "+PONG\r\n", 7);
+        c->bufpos += 7;
+        return 1;
+    }
+
+    /* GET <key> */
+    if (c->parsed_cmd->proc == getCommand && c->argc == 2) {
+        return nexFastPathEmitBulk(c, c->argv[1]);
+    }
+
+    /* MGET <key> [key ...]: all-or-nothing — every key must be a NexStorage
+     * string hit, otherwise roll the buffer back and let the main thread run
+     * the whole command (a miss may still exist in the main DB). */
+    if (c->parsed_cmd->proc == mgetCommand && c->argc >= 2 && c->argc <= 64) {
+        int saved_bufpos = c->bufpos;
+        char hdr[16];
+        int hl = snprintf(hdr, sizeof(hdr), "*%d\r\n", c->argc - 1);
+        if ((size_t)c->bufpos + hl > c->buf_usable_size) return 0;
+        memcpy(c->buf + c->bufpos, hdr, hl);
+        c->bufpos += hl;
+        for (int j = 1; j < c->argc; j++) {
+            if (!nexFastPathEmitBulk(c, c->argv[j])) {
+                c->bufpos = saved_bufpos;
+                return 0;
+            }
+        }
+        return 1;
+    }
+
+    return 0;
+}
+
+static void nexIOThreadFastPath(client *c) {
+    int consumed = 0;
+    while (nexFastPathTryCurrent(c)) {
+        consumed++;
+        /* Free the executed command's argv (IO threads free argv routinely). */
+        for (int j = 0; j < c->argc; j++) decrRefCount(c->argv[j]);
+        zfree(c->argv);
+        c->argv = NULL;
+        c->argc = 0;
+        c->argv_len = 0;
+        c->argv_len_sum = 0;
+        c->parsed_cmd = NULL;
+
+        /* Promote the next parsed command from the queue into the current
+         * slot, mirroring consumeCommandQueue() so the main thread finds a
+         * perfectly ordinary state: one current command plus a queue tail. */
+        cmdQueue *queue = &c->cmd_queue;
+        if (queue->off < queue->len) {
+            parsedCommand *p = &queue->cmds[queue->off++];
+            c->read_flags |= p->read_flags;
+            c->argc = p->argc;
+            c->argv = p->argv;
+            c->argv_len = p->argv_len;
+            c->argv_len_sum = p->argv_len_sum;
+            c->net_input_bytes_curr_cmd = p->input_bytes;
+            c->parsed_cmd = p->cmd;
+            c->slot = p->slot;
+            if (queue->off == queue->len) queue->off = queue->len = 0;
+        } else {
+            /* Whole pipeline served from the IO thread: nothing left for the
+             * main thread to execute. Clearing PARSING_COMPLETED makes the
+             * main thread treat this read as "no pending command". */
+            c->read_flags &= ~READ_FLAGS_PARSING_COMPLETED;
+            break;
+        }
+    }
+    if (consumed) c->read_flags |= READ_FLAGS_FASTPATH_REPLIED;
+}
+
 void ioThreadReadQueryFromClient(void *data) {
     client *c = data;
     serverAssert(c->io_read_state == CLIENT_PENDING_IO);
@@ -6564,6 +6683,11 @@ void ioThreadReadQueryFromClient(void *data) {
     /* Empty command - Multibulk processing could see a <= 0 length. */
     if (c->argc == 0) {
         goto done;
+    }
+
+    /* NEX-FASTPATH: serve an eligible GET prefix right here in the IO thread. */
+    if ((c->read_flags & READ_FLAGS_FASTPATH_OK) && (c->read_flags & READ_FLAGS_PARSING_COMPLETED)) {
+        nexIOThreadFastPath(c);
     }
 
 done:

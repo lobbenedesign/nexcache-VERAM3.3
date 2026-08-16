@@ -32,6 +32,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <errno.h>
+#if defined(__linux__)
+#include <sys/random.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 /* ── Utility ────────────────────────────────────────────────── */
 static uint64_t pq_us_now(void) {
@@ -180,14 +187,60 @@ void pq_blake3_hash(const uint8_t *data, size_t len,
  *   [32B] padding/extension
  */
 
-static uint32_t pq_prng_seed = 0xDEADBEEF;
+/* PRIMA: un xorshift32 seedato col timestamp in microsecondi al process
+ * start (pq_crypto_init). Un attaccante che stima l'orario di avvio del
+ * server (uptime, log, timestamp del certificato TLS) può forzare il seed
+ * a 32 bit e rigenerare l'intera keypair "Dilithium" (pq_sign_keygen) e i
+ * nonce dei token di sessione (pq_generate_token) — in un modulo che si
+ * autodescrive come "enterprise security" e serve a firmare i log Raft.
+ * Inoltre pq_prng_seed era uno stato globale mutato senza lock: race
+ * condition sotto connessioni concorrenti (nonce/chiavi duplicati).
+ *
+ * ORA: riempimento diretto da CSPRNG del sistema operativo (getrandom su
+ * Linux, /dev/urandom altrove) per ogni chiamata. Niente stato globale da
+ * proteggere, niente seed prevedibile. */
+static void pq_secure_random(uint8_t *buf, size_t len) {
+    size_t filled = 0;
+#if defined(__linux__)
+    while (filled < len) {
+        ssize_t r = getrandom(buf + filled, len - filled, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        filled += (size_t)r;
+    }
+#endif
+    if (filled < len) {
+        int fd = open("/dev/urandom", O_RDONLY);
+        if (fd >= 0) {
+            while (filled < len) {
+                ssize_t r = read(fd, buf + filled, len - filled);
+                if (r <= 0) {
+                    if (r < 0 && errno == EINTR) continue;
+                    break;
+                }
+                filled += (size_t)r;
+            }
+            close(fd);
+        }
+    }
+    if (filled < len) {
+        /* Nessuna fonte di entropia del SO disponibile: è un errore fatale
+         * per materiale crittografico, non un caso da degradare in
+         * silenzio a un fallback debole. */
+        fprintf(stderr,
+                "[NexCache PQ] FATAL: impossibile ottenere entropia sicura dal sistema "
+                "operativo (getrandom/dev/urandom falliti) — abort per evitare chiavi "
+                "prevedibili.\n");
+        abort();
+    }
+}
 
 static uint32_t pq_prng(void) {
-    /* xorshift32 */
-    pq_prng_seed ^= pq_prng_seed << 13;
-    pq_prng_seed ^= pq_prng_seed >> 17;
-    pq_prng_seed ^= pq_prng_seed << 5;
-    return pq_prng_seed;
+    uint32_t v;
+    pq_secure_random((uint8_t *)&v, sizeof(v));
+    return v;
 }
 
 int pq_generate_token(const char *namespace_id,
@@ -306,9 +359,12 @@ int pq_sign_keygen(uint8_t *pub_key, size_t pub_len, uint8_t *priv_key, size_t p
     if (!pub_key || !priv_key) return -1;
     size_t pk = pub_len < DILITHIUM3_PK_BYTES ? pub_len : DILITHIUM3_PK_BYTES;
     size_t sk = priv_len < DILITHIUM3_SK_BYTES ? priv_len : DILITHIUM3_SK_BYTES;
-    /* In attesa di liboqs: genera chiavi deterministiche da PRNG */
-    for (size_t i = 0; i < pk; i++) pub_key[i] = (uint8_t)pq_prng();
-    for (size_t i = 0; i < sk; i++) priv_key[i] = (uint8_t)pq_prng();
+    /* In attesa di liboqs: genera chiavi da CSPRNG del SO (non dal PRNG
+     * xorshift interno — vedi commento su pq_secure_random). Queste NON
+     * sono vere chiavi Dilithium valide (serve liboqs per quello), ma
+     * almeno non sono più forgeable da chi indovina l'orario di boot. */
+    pq_secure_random(pub_key, pk);
+    pq_secure_random(priv_key, sk);
     fprintf(stderr, "[NexCache PQ] WARNING: Dilithium STUB — install liboqs for production\n");
     return 0;
 }
@@ -339,8 +395,6 @@ int pq_verify(const uint8_t *msg, size_t msg_len, const uint8_t *sig, size_t sig
 
 /* ── pq_crypto_init/shutdown ────────────────────────────────── */
 int pq_crypto_init(void) {
-    /* Seed PRNG da timestamp */
-    pq_prng_seed = (uint32_t)pq_us_now();
     fprintf(stderr, "[NexCache PQ] Crypto init: BLAKE3=native"
 #ifdef HAVE_LIBOQS
                     " Dilithium3=liboqs"

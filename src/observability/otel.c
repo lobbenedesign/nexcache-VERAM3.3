@@ -23,7 +23,8 @@ static _Atomic uint64_t g_span_tail; /* Indice consumatore */
 typedef struct HotKeyEntry {
     char key[512];
     uint64_t count_total;
-    uint64_t count_1m; /* Reset ogni minuto */
+    uint64_t count_1m; /* Reset ogni minuto (vedi minute_bucket) */
+    uint64_t minute_bucket; /* obs_us_now()/60000000 all'ultimo reset di count_1m */
     uint64_t last_access;
     uint8_t is_write;
     uint32_t shard;
@@ -61,16 +62,67 @@ static uint32_t fnv1a(const char *key, size_t len) {
     return h;
 }
 
-/* ── Percentili approssimati via reservoir ─────────────────── */
-static double percentile_approx(double running_avg, double sample, double pct) {
-    /* Approssimazione con EWMA pesata — accurata per percentili stabili */
-    double alpha = 1.0 - pct / 100.0;
-    return running_avg * (1.0 - alpha * 0.01) + sample * alpha * 0.01;
+/* ── Percentili reali su un reservoir a finestra scorrevole ───
+ * PRIMA: "percentile_approx" era in realtà una EWMA — per p99 il peso
+ * per campione è (1-99/100)*0.01 = 0.0001, per p999 0.00001: una media
+ * mobile lentissima che converge verso la MEDIA, non verso alcun
+ * percentile. Non può strutturalmente catturare la coda di latenza (lo
+ * scopo dichiarato del modulo), e i numeri esposti su /info, /metrics e
+ * la dashboard erano fuorvianti — proprio le metriche che servirebbero
+ * per un confronto onesto di tail-latency contro Redis/Garnet.
+ * ORA: le ultime LATENCY_RESERVOIR_SIZE latenze vengono tenute in un
+ * buffer circolare; il percentile si calcola per davvero (sort + indice)
+ * al momento della lettura, non incrementalmente ad ogni comando (che
+ * richiederebbe una struttura tipo t-digest/histogram per restare O(1) —
+ * qui la lettura è rara rispetto alla scrittura, quindi un sort O(n log n)
+ * on-demand su un reservoir di dimensione fissa è la scelta più semplice
+ * corretta). */
+#define LATENCY_RESERVOIR_SIZE 4096
+static double g_lat_reservoir[LATENCY_RESERVOIR_SIZE];
+static uint64_t g_lat_reservoir_pos = 0; /* Prossimo slot da sovrascrivere */
+static uint64_t g_lat_reservoir_count = 0; /* Quanti slot validi (satura a SIZE) */
+
+static int cmp_double(const void *a, const void *b) {
+    double da = *(const double *)a, db = *(const double *)b;
+    return (da > db) - (da < db);
+}
+
+/* Il chiamante deve tenere g_met_lock. */
+static void latency_reservoir_push(double sample) {
+    g_lat_reservoir[g_lat_reservoir_pos] = sample;
+    g_lat_reservoir_pos = (g_lat_reservoir_pos + 1) % LATENCY_RESERVOIR_SIZE;
+    if (g_lat_reservoir_count < LATENCY_RESERVOIR_SIZE) g_lat_reservoir_count++;
+}
+
+/* Calcola p50/p99/p999 reali dal reservoir corrente. Il chiamante deve
+ * tenere g_met_lock (o aver già copiato out il buffer). */
+static void latency_reservoir_percentiles(double *p50, double *p99, double *p999) {
+    if (g_lat_reservoir_count == 0) {
+        *p50 = *p99 = *p999 = 0.0;
+        return;
+    }
+    double tmp[LATENCY_RESERVOIR_SIZE];
+    memcpy(tmp, g_lat_reservoir, g_lat_reservoir_count * sizeof(double));
+    qsort(tmp, g_lat_reservoir_count, sizeof(double), cmp_double);
+    size_t n = g_lat_reservoir_count;
+    size_t i50 = (n * 50) / 100;   if (i50 >= n) i50 = n - 1;
+    size_t i99 = (n * 99) / 100;   if (i99 >= n) i99 = n - 1;
+    size_t i999 = (n * 999) / 1000; if (i999 >= n) i999 = n - 1;
+    *p50 = tmp[i50];
+    *p99 = tmp[i99];
+    *p999 = tmp[i999];
 }
 
 /* ── obs_init ───────────────────────────────────────────────── */
 int obs_init(uint16_t dashboard_port, int enable_pii_masking, const char *otlp_endpoint) {
-    (void)dashboard_port; /* TODO: avvia HTTP server embedded */
+    /* NOTA: questa funzione NON avvia il dashboard HTTP nonostante il
+     * parametro dashboard_port lo lasci intendere (vedi otel.h: "@dashboard_port:
+     * Porta del dashboard web") — dashboard_init() in dashboard.c è un
+     * entry point separato e va chiamato indipendentemente dal
+     * chiamante. Il parametro è mantenuto per compatibilità di firma ma
+     * è un no-op qui; non dedurre che il dashboard sia attivo solo perché
+     * obs_init() è stata chiamata con una porta valida. */
+    (void)dashboard_port;
 
     atomic_init(&g_span_head, 0);
     atomic_init(&g_span_tail, 0);
@@ -80,6 +132,9 @@ int obs_init(uint16_t dashboard_port, int enable_pii_masking, const char *otlp_e
     memset(g_hotkeys, 0, sizeof(g_hotkeys));
     memset(g_slow_ring, 0, sizeof(g_slow_ring));
     memset(&g_metrics, 0, sizeof(g_metrics));
+    memset(g_lat_reservoir, 0, sizeof(g_lat_reservoir));
+    g_lat_reservoir_pos = 0;
+    g_lat_reservoir_count = 0;
 
     g_pii_masking = enable_pii_masking;
     if (otlp_endpoint)
@@ -145,11 +200,10 @@ void obs_record_command(const OTelSpan *span) {
     g_metrics.bytes_received += span->bytes_in;
     g_metrics.bytes_sent += span->bytes_out;
 
-    /* Percentili latenza (approssimazione rolling) */
+    /* Percentili latenza: campiona nel reservoir, calcolati per davvero
+     * (sort) al momento della lettura in obs_get_metrics/_locked. */
     double lat = (double)span->latency_us;
-    g_metrics.latency_p50_us = percentile_approx(g_metrics.latency_p50_us, lat, 50.0);
-    g_metrics.latency_p99_us = percentile_approx(g_metrics.latency_p99_us, lat, 99.0);
-    g_metrics.latency_p999_us = percentile_approx(g_metrics.latency_p999_us, lat, 99.9);
+    latency_reservoir_push(lat);
     if (lat > g_metrics.latency_max_us) g_metrics.latency_max_us = lat;
 
     /* Hit rate */
@@ -193,15 +247,28 @@ void obs_hotkey_access(const char *key, size_t keylen, int is_write) {
         if (++probes > 16) goto done; /* evita loop infinito */
     }
 
+    uint64_t now = obs_us_now();
+    uint64_t cur_minute = now / 60000000ULL;
+
     if (!e->occupied) {
         strncpy(e->key, key, sizeof(e->key) - 1);
         e->occupied = 1;
         e->count_total = 0;
         e->count_1m = 0;
+        e->minute_bucket = cur_minute;
+    } else if (e->minute_bucket != cur_minute) {
+        /* PRIMA: count_1m veniva azzerato solo alla prima creazione dello
+         * slot e mai più — cresceva identico a count_total per sempre,
+         * rendendo il campo inutile per capire cosa è "caldo adesso" vs
+         * "caldo da sempre" (esattamente l'uso dichiarato nel commento
+         * "Reset ogni minuto"). Reset lazy basato sul minuto reale
+         * dell'ultimo accesso, senza bisogno di un thread cron dedicato. */
+        e->count_1m = 0;
+        e->minute_bucket = cur_minute;
     }
     e->count_total++;
     e->count_1m++;
-    e->last_access = obs_us_now();
+    e->last_access = now;
     e->is_write = (uint8_t)is_write;
 
 done:
@@ -213,18 +280,46 @@ int obs_get_hotkeys(int topn, HotKey *out, int out_cap) {
     if (!out || out_cap <= 0) return 0;
     if (topn > out_cap) topn = out_cap;
 
-    /* Copia locale e sort per count_total (selezione parziale O(N*topn)) */
+    /* PRIMA: il commento diceva "sort per count_total" ma il codice si
+     * limitava a prendere i primi `topn` slot OCCUPATI nell'ordine della
+     * tabella hash, senza mai confrontare count_total — su un server con
+     * traffico reale questo ritorna chiavi essenzialmente arbitrarie, non
+     * quelle davvero più accedute (bug funzionale nella feature di punta
+     * "hot key detection real-time" dichiarata nell'header del modulo).
+     * ORA: selezione top-K vera via inserimento in `out` mantenuto
+     * ordinato per count_total decrescente (O(N*topn), corretto per il
+     * topn tipicamente piccolo con cui questa funzione viene chiamata). */
     pthread_mutex_lock(&g_hk_lock);
 
     int count = 0;
-    for (int i = 0; i < HOTKEY_TABLE_SIZE && count < topn; i++) {
+    for (int i = 0; i < HOTKEY_TABLE_SIZE; i++) {
         HotKeyEntry *e = &g_hotkeys[i];
         if (!e->occupied) continue;
-        out[count].access_count = e->count_total;
-        out[count].access_1m = e->count_1m;
-        out[count].is_write = e->is_write;
-        strncpy(out[count].key, e->key, sizeof(out[count].key) - 1);
-        count++;
+
+        if (count < topn) {
+            /* Ancora spazio libero: inserisci in posizione ordinata */
+            int pos = count;
+            while (pos > 0 && out[pos - 1].access_count < e->count_total) {
+                out[pos] = out[pos - 1];
+                pos--;
+            }
+            out[pos].access_count = e->count_total;
+            out[pos].access_1m = e->count_1m;
+            out[pos].is_write = e->is_write;
+            strncpy(out[pos].key, e->key, sizeof(out[pos].key) - 1);
+            count++;
+        } else if (e->count_total > out[topn - 1].access_count) {
+            /* Sostituisce il più piccolo del top-K corrente, mantenendo l'ordine */
+            int pos = topn - 1;
+            while (pos > 0 && out[pos - 1].access_count < e->count_total) {
+                out[pos] = out[pos - 1];
+                pos--;
+            }
+            out[pos].access_count = e->count_total;
+            out[pos].access_1m = e->count_1m;
+            out[pos].is_write = e->is_write;
+            strncpy(out[pos].key, e->key, sizeof(out[pos].key) - 1);
+        }
     }
 
     pthread_mutex_unlock(&g_hk_lock);
@@ -249,6 +344,11 @@ int obs_get_slow_queries(SlowQuery *out, int max) {
 NexMetrics obs_get_metrics(void) {
     pthread_mutex_lock(&g_met_lock);
     NexMetrics m = g_metrics;
+    double p50, p99, p999;
+    latency_reservoir_percentiles(&p50, &p99, &p999);
+    m.latency_p50_us = p50;
+    m.latency_p99_us = p99;
+    m.latency_p999_us = p999;
     pthread_mutex_unlock(&g_met_lock);
     return m;
 }

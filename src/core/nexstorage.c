@@ -30,44 +30,102 @@ static uint64_t nd_us_now_storage(void) {
     return (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
 }
 
+/* NDValue è un unico blocco malloc (header + data contigui, val->data =
+ * val+1), quindi free() semplice lo libera per intero. */
+static void ndvalue_free_cb(void *value) {
+    free(value);
+}
+
 static void *ndapi_create(const char *config_str) {
     size_t max_mem = 256 * 1024 * 1024; /* Default 256MB */
     if (config_str) {
         const char *p = strstr(config_str, "max_memory=");
         if (p) max_mem = (size_t)atol(p + 11);
     }
-    return nexdash_create(4, max_mem);
+    NexDashTable *t = nexdash_create(4, max_mem);
+    /* Senza questa callback, nexdash_set/del/evict/scan_expired non sanno
+     * come liberare il vecchio NDValue: ogni overwrite/del/eviction perdeva
+     * memoria in modo permanente. */
+    if (t) nexdash_set_free_cb(t, ndvalue_free_cb);
+    return t;
 }
 
 static void ndapi_destroy(void *backend) {
     nexdash_destroy((NexDashTable *)backend);
 }
 
+/* NexDashSlot codifica la lunghezza chiave in 8 bit (TAG_GET_LEN):
+ * chiavi >255 byte non possono essere rappresentate. PRIMA venivano
+ * troncate silenziosamente a 255 byte, causando collisioni/corruzione
+ * dati tra chiavi diverse che condividono lo stesso prefisso di 255 byte
+ * (SET su una chiave lunga sovrascriveva/aliasava un'altra chiave con lo
+ * stesso prefisso). Rifiutare esplicitamente è corretto; supportare
+ * davvero chiavi lunghe richiede allargare TAG_GET_LEN (redesign del
+ * tagged pointer, fuori scope qui). */
+#define ND_MAX_KEY_LEN 255
+
+/* PRIMA: ndapi_get chiamava nexdash_get() (che prende e rilascia il lock
+ * INTERNAMENTE, per singola chiamata) e poi esponeva al chiamante
+ * `out->value = val->data` — un puntatore VIVO dentro il blocco allocato
+ * per quel value, ma restituito DOPO che il lock di nexdash era già
+ * stato rilasciato. Qualunque consumatore di NexEntry (incluso il
+ * fast-path Garnet-style di io_threads.c/networking.c, che ritarda la
+ * memcpy nel buffer di rete fino a dopo la chiamata) ha quindi una
+ * finestra in cui un altro thread può fare SET sulla stessa chiave,
+ * ndapi_set/nexdash_set_nolock chiama free_cb() sul vecchio valore (fix
+ * di oggi per eliminare il leak — vedi commento su ndvalue_free_cb) e
+ * libera esattamente la memoria che il lettore sta per copiare: use-
+ * after-free. PRIMA del fix leak di oggi questo non era sfruttabile
+ * (il vecchio valore veniva perso ma mai liberato, quindi restava
+ * "valido" anche se stale) — eliminare il leak ha reso reale una race
+ * che prima era solo latente.
+ * ORA: get+copia avvengono nello stesso lock hold (nexdash_lock/
+ * nexdash_get_nolock/nexdash_unlock, già usati da ndapi_rmw per lo
+ * stesso motivo), copiando i byte in uno scratch buffer thread-local
+ * PRIMA di rilasciare il lock — stesso pattern già usato da scapi_get
+ * per il backend Segcache. Il puntatore restituito al chiamante punta
+ * sempre a questo buffer, mai più alla memoria interna della tabella. */
 static NexStorageResult ndapi_get(void *backend,
                                   const char *key,
                                   uint32_t key_len,
                                   NexEntry *out) {
+    if (key_len > ND_MAX_KEY_LEN) return NEXS_TOO_LARGE;
     NexDashTable *t = (NexDashTable *)backend;
-    uint8_t klen8 = (uint8_t)(key_len > 255 ? 255 : key_len);
+    uint8_t klen8 = (uint8_t)key_len;
+
+    static _Thread_local uint8_t buf[1024 * 1024];
+
+    nexdash_lock(t);
     NexEntryType et;
-    NDValue *val = (NDValue *)nexdash_get(t, key, klen8, &et);
-    if (!val) return NEXS_NOT_FOUND;
-
-    /* Controlla scadenza */
-    if (val->expire_us > 0 && val->expire_us <= (int64_t)nd_us_now_storage()) {
-        nexdash_del(t, key, klen8);
-        return NEXS_EXPIRED;
+    NDValue *val = (NDValue *)nexdash_get_nolock(t, key, klen8, &et);
+    if (!val) {
+        nexdash_unlock(t);
+        return NEXS_NOT_FOUND;
     }
+    if (val->data_len > sizeof(buf)) {
+        /* Valore più grande dello scratch buffer: non possiamo copiarlo
+         * in sicurezza qui. Meglio fallire esplicitamente che troncare
+         * silenziosamente (comportamento consistente con ND_MAX_KEY_LEN
+         * sopra: rifiuto esplicito invece di corruzione silenziosa). */
+        nexdash_unlock(t);
+        return NEXS_TOO_LARGE;
+    }
+    memcpy(buf, val->data, val->data_len);
+    uint32_t data_len = val->data_len;
+    NexDataType type = val->type;
+    uint64_t version = val->version;
+    int64_t expire_us = val->expire_us;
+    nexdash_unlock(t);
 
-    out->value = val->data;
-    out->value_len = val->data_len;
-    out->type = val->type;
-    out->version = val->version;
+    out->value = buf;
+    out->value_len = data_len;
+    out->type = type;
+    out->version = version;
 
-    if (val->expire_us < 0) {
+    if (expire_us < 0) {
         out->ttl_ms = -1;
     } else {
-        int64_t remaining = val->expire_us - (int64_t)nd_us_now_storage();
+        int64_t remaining = expire_us - (int64_t)nd_us_now_storage();
         out->ttl_ms = remaining > 0 ? remaining / 1000 : -2;
     }
     return NEXS_OK;
@@ -80,8 +138,9 @@ static NexStorageResult ndapi_set(void *backend,
                                   uint32_t value_len,
                                   NexDataType type,
                                   int64_t ttl_ms) {
+    if (key_len > ND_MAX_KEY_LEN) return NEXS_TOO_LARGE;
     NexDashTable *t = (NexDashTable *)backend;
-    uint8_t klen8 = (uint8_t)(key_len > 255 ? 255 : key_len);
+    uint8_t klen8 = (uint8_t)key_len;
 
     /* Crea NDValue container */
     NDValue *val = (NDValue *)malloc(sizeof(NDValue) + value_len);
@@ -97,8 +156,9 @@ static NexStorageResult ndapi_set(void *backend,
     uint64_t expire_us_arg = (ttl_ms >= 0) ? (nd_us_now_storage() + (uint64_t)ttl_ms * 1000) : 0;
 
     NexEntryType net = (NexEntryType)type;
-    int rc = nexdash_set(t, key, klen8, val, net, expire_us_arg);
-    if (rc < 0) {
+    uint32_t total_size = (uint32_t)(sizeof(NDValue) + value_len);
+    int rc = nexdash_set(t, key, klen8, val, total_size, net, expire_us_arg);
+    if (!rc) {
         free(val);
         return NEXS_ERROR;
     }
@@ -108,19 +168,28 @@ static NexStorageResult ndapi_set(void *backend,
 static NexStorageResult ndapi_del(void *backend,
                                   const char *key,
                                   uint32_t key_len) {
+    if (key_len > ND_MAX_KEY_LEN) return NEXS_NOT_FOUND;
     NexDashTable *t = (NexDashTable *)backend;
-    uint8_t klen8 = (uint8_t)(key_len > 255 ? 255 : key_len);
+    uint8_t klen8 = (uint8_t)key_len;
     int rc = nexdash_del(t, key, klen8);
     return rc > 0 ? NEXS_OK : NEXS_NOT_FOUND;
 }
 
 static int ndapi_exists(void *backend, const char *key, uint32_t key_len) {
+    if (key_len > ND_MAX_KEY_LEN) return 0;
     NexDashTable *t = (NexDashTable *)backend;
-    uint8_t klen8 = (uint8_t)(key_len > 255 ? 255 : key_len);
+    uint8_t klen8 = (uint8_t)key_len;
     return nexdash_exists(t, key, klen8);
 }
 
-/* RMW atomico: leggi → modifica → scrivi sotto lock NexDash row */
+/* RMW atomico: leggi → modifica → scrivi sotto lo stesso lock della tabella.
+ * PRIMA: get e set erano due chiamate separate a nexdash_get/nexdash_set,
+ * ciascuna con il proprio lock-acquire-release — tra le due nulla impediva
+ * a un secondo INCR/HSET concorrente di intercalarsi, leggere lo stesso
+ * valore base e sovrascrivere l'aggiornamento del primo (lost update).
+ * ORA: nexdash_lock() viene tenuto per l'intera sequenza get→cb→set via
+ * le varianti _nolock, rendendo l'operazione davvero atomica come
+ * documentato in nexstorage.h. */
 static NexStorageResult ndapi_rmw(void *backend,
                                   const char *key,
                                   uint32_t key_len,
@@ -128,15 +197,52 @@ static NexStorageResult ndapi_rmw(void *backend,
                                   const void *input,
                                   void *output,
                                   void *ctx) {
+    if (key_len > ND_MAX_KEY_LEN) return NEXS_TOO_LARGE;
+    NexDashTable *t = (NexDashTable *)backend;
+    uint8_t klen8 = (uint8_t)key_len;
+
+    nexdash_lock(t);
+
     NexEntry entry = {0};
     entry.ttl_ms = -1;
-    (void)ndapi_get(backend, key, key_len, &entry);
+    NexEntryType et;
+    NDValue *val = (NDValue *)nexdash_get_nolock(t, key, klen8, &et);
+    if (val) {
+        entry.value = val->data;
+        entry.value_len = val->data_len;
+        entry.type = val->type;
+        entry.version = val->version;
+        if (val->expire_us < 0) {
+            entry.ttl_ms = -1;
+        } else {
+            int64_t remaining = val->expire_us - (int64_t)nd_us_now_storage();
+            entry.ttl_ms = remaining > 0 ? remaining / 1000 : -2;
+        }
+    }
 
     NexStorageResult res = cb(&entry, input, output, ctx);
     if (res == NEXS_OK) {
-        /* Se il callback ha avuto successo, scriviamo il nuovo stato */
-        ndapi_set(backend, key, key_len, entry.value, entry.value_len, entry.type, entry.ttl_ms);
+        NDValue *nv = (NDValue *)malloc(sizeof(NDValue) + entry.value_len);
+        if (!nv) {
+            nexdash_unlock(t);
+            return NEXS_ERROR;
+        }
+        nv->data = (uint8_t *)(nv + 1);
+        nv->data_len = entry.value_len;
+        nv->type = entry.type;
+        nv->version = nd_us_now_storage();
+        nv->expire_us = (entry.ttl_ms >= 0) ? (int64_t)(nd_us_now_storage() + (uint64_t)entry.ttl_ms * 1000) : -1;
+        if (entry.value_len) memcpy(nv->data, entry.value, entry.value_len);
+
+        uint64_t expire_us_arg = (entry.ttl_ms >= 0) ? (nd_us_now_storage() + (uint64_t)entry.ttl_ms * 1000) : 0;
+        uint32_t total_size = (uint32_t)(sizeof(NDValue) + entry.value_len);
+        if (!nexdash_set_nolock(t, key, klen8, nv, total_size, (NexEntryType)entry.type, expire_us_arg)) {
+            free(nv);
+            nexdash_unlock(t);
+            return NEXS_ERROR;
+        }
     }
+    nexdash_unlock(t);
     return res;
 }
 
@@ -144,8 +250,9 @@ static NexStorageResult ndapi_expire(void *backend,
                                      const char *key,
                                      uint32_t key_len,
                                      int64_t ttl_ms) {
+    if (key_len > ND_MAX_KEY_LEN) return NEXS_NOT_FOUND;
     NexDashTable *t = (NexDashTable *)backend;
-    uint8_t klen8 = (uint8_t)(key_len > 255 ? 255 : key_len);
+    uint8_t klen8 = (uint8_t)key_len;
     uint64_t expire_us = (ttl_ms >= 0) ? (nd_us_now_storage() + (uint64_t)ttl_ms * 1000) : 0;
     int rc = nexdash_expire(t, key, klen8, expire_us);
     return rc > 0 ? NEXS_OK : NEXS_NOT_FOUND;
@@ -304,8 +411,11 @@ static NexStorageResult scapi_get(void *backend,
                                   const char *key,
                                   uint32_t klen,
                                   NexEntry *out) {
-    /* G3-GODMODE: Thread-Local Scratchpad for Zero-Contention Vera Lookups */
-    static _Thread_local uint8_t buf[65536];
+    /* G3-GODMODE: Thread-Local Scratchpad for Zero-Contention Vera Lookups.
+     * NEX-FIX: 65535, NOT 65536 — segcache_get takes a uint16_t buf_len, and
+     * (uint16_t)65536 == 0, which made EVERY lookup fail with "buffer too
+     * small" and report NOT_FOUND, disabling the whole NexStorage read path. */
+    static _Thread_local uint8_t buf[65535];
     uint16_t vlen = 0;
     int rc = segcache_get((NexSegcache *)backend, key, (uint16_t)klen,
                           buf, (uint16_t)sizeof(buf), &vlen);
@@ -358,7 +468,14 @@ static NexStorageResult scapi_rmw(void *b, const char *k, uint32_t kl, NexRMWCal
     NexEntry entry = {0};
     entry.ttl_ms = -1;
     scapi_get(b, k, kl, &entry);
-    return cb(&entry, in, out, ctx);
+    NexStorageResult res = cb(&entry, in, out, ctx);
+    if (res == NEXS_OK) {
+        /* PRIMA: il risultato del callback non veniva mai scritto indietro —
+         * ogni RMW su backend Segcache (INCR/HSET su chiavi TTL-heavy)
+         * calcolava il nuovo valore e lo scartava silenziosamente. */
+        scapi_set(b, k, kl, entry.value, entry.value_len, entry.type, entry.ttl_ms);
+    }
+    return res;
 }
 static NexStorageResult scapi_expire(void *b, const char *k, uint32_t kl, int64_t ttl_ms) {
     (void)b;
@@ -454,7 +571,11 @@ static void flashapi_destroy(void *b) {
 }
 
 static NexStorageResult flashapi_get(void *b, const char *k, uint32_t kl, NexEntry *out) {
-    static uint8_t buf[1024 * 1024]; /* 1MB buffer limit per read in this adapter */
+    /* PRIMA: buffer static (non thread-local) condiviso da tutti gli 8
+     * worker — due GET concorrenti sul backend Flash si sovrascrivevano a
+     * vicenda il buffer, corrompendo i value ritornati. scapi_get (sopra)
+     * usa correttamente _Thread_local per lo stesso motivo. */
+    static _Thread_local uint8_t buf[1024 * 1024]; /* 1MB buffer limit per read in this adapter */
     uint32_t vlen = 0;
     uint64_t h = flash_hash_fnv1a(k, kl);
     int rc = flash_read((FlashStorage *)b, h, buf, sizeof(buf), &vlen);

@@ -22,8 +22,16 @@
  * Al fine del file, ricreiamo mock esterni se mancano per ora.
  */
 
-/* Mock-ups se non sono presenti nel linker */
-const NetBackend __attribute__((weak)) DpdkBackend = {"dpdk", NULL, NULL, NULL, NULL, NULL};
+/* Mock-ups se non sono presenti nel linker.
+ * PRIMA: questo stub si chiamava "DpdkBackend" (minuscolo dopo la D),
+ * mentre net_backend.h dichiara "extern const NetBackend DPDKBackend" e
+ * dpdk_net.c definisce il simbolo forte "DPDKBackend" — nomi diversi,
+ * quindi il linker non risolveva mai lo stub debole verso l'implementazione
+ * reale: fb_init chiamava sempre e solo questo mock (init=NULL), mai
+ * DPDKBackend da dpdk_net.c. Oggi è innocuo perché dpdk_init() ritorna
+ * comunque sempre -1, ma il giorno in cui quel backend verrà implementato
+ * davvero smetterà di essere agganciato, silenziosamente. */
+const NetBackend __attribute__((weak)) DPDKBackend = {"dpdk", NULL, NULL, NULL, NULL, NULL};
 const NetBackend __attribute__((weak)) IoUringBackend = {"io_uring", NULL, NULL, NULL, NULL, NULL};
 const NetBackend __attribute__((weak)) EpollBackend = {"epoll", NULL, NULL, NULL, NULL, NULL};
 
@@ -34,7 +42,7 @@ static NetStats combined_stats = {0, 0, 0, 0, 0};
 
 static int fb_init(const char *interface, int num_queues) {
     const NetBackend *candidates[] = {
-        &DpdkBackend,
+        &DPDKBackend,
         &IoUringBackend,
         &EpollBackend};
 
@@ -55,10 +63,23 @@ static int fb_init(const char *interface, int num_queues) {
         }
     }
 
-    /* Fallback di emergenza: se epoll() mock fallisce nei test, fingiamo successo in epoll */
-    printf("[Net] Tutti i backend hardware falliti. Uso simulatore Epoll (Safe Fallback).\n");
-    active_backend = &EpollBackend;
-    return 0;
+    /* PRIMA: si dichiarava sempre successo assegnando EpollBackend come
+     * "fallback sicuro" — ma EpollBackend non ha (qui) una vera
+     * implementazione epoll dietro (init/recv/send sono NULL: nessun file
+     * in questo modulo fornisce il simbolo forte). fb_recv/fb_send
+     * ritornavano quindi silenziosamente 0 pacchetti per sempre, mentre
+     * il chiamante credeva che l'inizializzazione fosse riuscita — questo
+     * modulo di networking astratto (DPDK/io_uring/epoll pluggable) non è
+     * oggi collegato al path client reale del server (quello usa
+     * ae_epoll.c, il event loop Redis vanilla), ma se mai qualcuno lo
+     * aggancia deve ricevere un errore onesto, non un falso OK.
+     * ORA: si fallisce esplicitamente se nessun backend con una vera
+     * implementazione ha inizializzato con successo. */
+    fprintf(stderr,
+            "[Net] Nessun backend di rete funzionante (DPDK/io_uring/epoll "
+            "sono tutti stub non implementati in questo modulo) — init fallita.\n");
+    active_backend = NULL;
+    return -1;
 }
 
 /* ── Forward delle Operazioni ───────────────────────────────── */

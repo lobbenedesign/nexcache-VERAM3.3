@@ -46,6 +46,19 @@
 
 extern NexStorage *global_nexstorage;
 
+/* Identità del nodo per i CRDT (G-Counter/PN-Counter/OR-Set/LWW), impostabile
+ * con la direttiva di config "nexcache-node-id" (vedi config.c). PRIMA era
+ * hardcoded a 0 in ogni comando GINCR/PNINCR (vedi sotto): dato che
+ * GCounter/PNCounter tengono un array values[CRDT_MAX_NODES] indicizzato per
+ * nodo e il merge fa max() per indice, due repliche che scrivessero entrambe
+ * con node_id=0 finirebbero indistinguibili — il merge tratterebbe i loro
+ * contributi come provenienti dallo stesso nodo (max invece di somma),
+ * risultato non convergente. Renderlo configurabile è la condizione
+ * necessaria (non sufficiente: serve anche un canale di replica/merge reale,
+ * che oggi non esiste in questo codebase — vedi nota in gincrCommand) perché
+ * il multi-master CRDT funzioni davvero quando quel canale verrà collegato. */
+unsigned int g_nexcache_node_id = 0;
+
 /* enumeration of all the possible return values of commands manipulating fields expiration. */
 typedef enum {
     /* SDS aux flag. If set, it indicates that the entry has TTL metadata set. */
@@ -2592,60 +2605,73 @@ static NexStorageResult gincr_callback(NexEntry *existing, const void *input, vo
     return NEXS_OK;
 }
 
-/* ── OR-SET RMW Logic ───────────────────────────────────────── */
+/* ── OR-SET RMW Logic ─────────────────────────────────────────
+ * PRIMA: reimplementazione ad-hoc con capacità fissa a 10 elementi per
+ * chiave — oltre i quali gli ADD fallivano silenziosamente pur
+ * rispondendo sempre "added=1" al client (il valore veniva scartato ma
+ * mai segnalato) — e tag hardcoded a 1 su OGNI add. Il tag serve a
+ * orset_merge (crdt.c) per distinguere add concorrenti fatti da
+ * nodi/momenti diversi: con tag sempre uguale, un eventuale merge
+ * tratterebbe ogni add come lo stesso evento logico, rompendo la
+ * convergenza matematica che è l'intero scopo di un OR-Set CRDT.
+ * ORA: usa l'API reale (orset_add/orset_remove/orset_deserialize/
+ * orset_serialize) — tag univoci via next_tag, origin_node corretto,
+ * nessun limite di capacità arbitrario (cresce dinamicamente).
+ * `ctx` qui è un `void **`: il buffer serializzato ha dimensione
+ * variabile (dipende da quanti elementi ha già il set), quindi non può
+ * essere preallocato dal chiamante a dimensione fissa come per
+ * GCounter/PNCounter — il callback alloca e il chiamante libera dopo
+ * che nexstorage_rmw ha fatto la sua copia interna. */
 static NexStorageResult orset_callback(NexEntry *existing, const void *input, void *output, void *ctx) {
     sds val = (sds)input;
-    ORSet *s = (ORSet *)ctx; /* We use ctx as a temp buffer */
+    void **out_buf = (void **)ctx;
 
-    if (existing->value && existing->type == NEXDT_CRDT) {
-        /* In real impl we should check value_len matches.
-           Here we assume fixed size ORSet for simplicity in the storage. */
-        memcpy(s, existing->value, existing->value_len);
-    } else {
-        /* Init a new ORSet in the ctx buffer */
-        memset(s, 0, sizeof(ORSet));
-        s->capacity = 10;                   /* Very small for demo serialization */
-        s->entries = (ORSetEntry *)(s + 1); /* Entries follow the struct */
-    }
+    ORSet *s = (existing->value && existing->type == NEXDT_CRDT)
+                   ? orset_deserialize(existing->value, existing->value_len, g_nexcache_node_id)
+                   : orset_create(g_nexcache_node_id);
+    if (!s) return NEXS_ERROR;
 
-    /* Simulate add (ignoring the pointer-based orset_add for fixed-layout here) */
-    if (s->count < 10) {
-        ORSetEntry *e = &((ORSetEntry *)(s + 1))[s->count++];
-        memcpy(e->value, val, sdslen(val) > 255 ? 255 : sdslen(val));
-        e->value_len = (uint16_t)sdslen(val);
-        e->add_tag = 1;
-    }
+    size_t vlen = sdslen(val) > 255 ? 255 : sdslen(val);
+    int rc = orset_add(s, (const uint8_t *)val, (uint16_t)vlen);
 
-    existing->value = (uint8_t *)s;
-    existing->value_len = sizeof(ORSet) + (10 * sizeof(ORSetEntry));
+    size_t needed = orset_serialized_size(s);
+    uint8_t *buf = (uint8_t *)zmalloc(needed > 0 ? needed : 1);
+    orset_serialize(s, buf, needed);
+    orset_destroy(s);
+
+    *out_buf = buf;
+    existing->value = buf;
+    existing->value_len = (uint32_t)needed;
     existing->type = NEXDT_CRDT;
-    *(int *)output = 1;
+    *(int *)output = (rc == 0) ? 1 : 0;
     return NEXS_OK;
 }
 
 static NexStorageResult orset_remove_callback(NexEntry *existing, const void *input, void *output, void *ctx) {
     sds val = (sds)input;
-    ORSet *s = (ORSet *)ctx;
-    if (existing->value && existing->type == NEXDT_CRDT) {
-        memcpy(s, existing->value, existing->value_len);
-        ORSetEntry *entries = (ORSetEntry *)(s + 1);
-        int found = 0;
-        for (uint32_t i = 0; i < s->count; i++) {
-            if (entries[i].value_len == sdslen(val) &&
-                memcmp(entries[i].value, val, entries[i].value_len) == 0 &&
-                !entries[i].is_removed) {
-                entries[i].is_removed = 1;
-                found = 1;
-            }
-        }
-        *(int *)output = found;
-        existing->value = (uint8_t *)s;
-        /* value_len remains same in this demo flat model */
-        existing->type = NEXDT_CRDT;
-        return NEXS_OK;
+    void **out_buf = (void **)ctx;
+
+    if (!existing->value || existing->type != NEXDT_CRDT) {
+        *(int *)output = 0;
+        return NEXS_NOT_FOUND;
     }
-    *(int *)output = 0;
-    return NEXS_NOT_FOUND;
+
+    ORSet *s = orset_deserialize(existing->value, existing->value_len, g_nexcache_node_id);
+    if (!s) return NEXS_ERROR;
+
+    int removed = orset_remove(s, (const uint8_t *)val, (uint16_t)sdslen(val));
+
+    size_t needed = orset_serialized_size(s);
+    uint8_t *buf = (uint8_t *)zmalloc(needed > 0 ? needed : 1);
+    orset_serialize(s, buf, needed);
+    orset_destroy(s);
+
+    *out_buf = buf;
+    existing->value = buf;
+    existing->value_len = (uint32_t)needed;
+    existing->type = NEXDT_CRDT;
+    *(int *)output = removed;
+    return NEXS_OK;
 }
 
 static NexStorageResult pnincr_callback(NexEntry *existing, const void *input, void *output, void *ctx) {
@@ -2698,7 +2724,7 @@ void gincrCommand(client *c) {
     if (getLongLongFromObjectOrReply(c, c->argv[2], &delta, NULL) != C_OK) return;
 
     sds key = objectGetVal(c->argv[1]);
-    GIncrInput in = {.delta = (uint64_t)delta, .node_id = 0}; /* Local node ID = 0 */
+    GIncrInput in = {.delta = (uint64_t)delta, .node_id = g_nexcache_node_id};
     uint64_t new_val = 0;
     GCounter g_tmp;
 
@@ -2739,14 +2765,11 @@ void orsetAddCommand(client *c) {
     sds key = objectGetVal(c->argv[1]);
     sds val = objectGetVal(c->argv[2]);
     int added = 0;
-
-    /* Temp buffer for ORSet + Entries (fixed size demo) */
-    size_t sz = sizeof(ORSet) + (10 * sizeof(ORSetEntry));
-    void *tmp = zmalloc(sz);
+    void *out_buf = NULL; /* Allocato da orset_callback (dimensione variabile), liberato qui */
 
     NexStorageResult res = nexstorage_rmw(global_nexstorage, key, sdslen(key),
-                                          orset_callback, val, &added, tmp);
-    zfree(tmp);
+                                          orset_callback, val, &added, &out_buf);
+    if (out_buf) zfree(out_buf);
 
     if (res == NEXS_OK) {
         addReplyLongLong(c, 1);
@@ -2784,7 +2807,7 @@ void pnincrCommand(client *c) {
     if (getLongLongFromObjectOrReply(c, c->argv[2], &delta, NULL) != C_OK) return;
 
     sds key = objectGetVal(c->argv[1]);
-    PNIncrInput in = {.delta = (int64_t)delta, .node_id = 0};
+    PNIncrInput in = {.delta = (int64_t)delta, .node_id = g_nexcache_node_id};
     int64_t new_val = 0;
     PNCounter p_tmp;
 
@@ -2825,19 +2848,59 @@ void orsetRemoveCommand(client *c) {
     sds key = objectGetVal(c->argv[1]);
     sds val = objectGetVal(c->argv[2]);
     int removed = 0;
-
-    size_t sz = sizeof(ORSet) + (10 * sizeof(ORSetEntry));
-    void *tmp = zmalloc(sz);
+    void *out_buf = NULL;
 
     NexStorageResult res = nexstorage_rmw(global_nexstorage, key, sdslen(key),
-                                          orset_remove_callback, val, &removed, tmp);
-    zfree(tmp);
+                                          orset_remove_callback, val, &removed, &out_buf);
+    if (out_buf) zfree(out_buf);
 
     if (res == NEXS_OK) {
         addReplyLongLong(c, removed);
     } else {
         addReplyError(c, "Errore durante la rimozione dall'ORSet");
     }
+}
+
+/* ORSET.MEMBERS key — legge i membri correnti dell'OR-Set. Colmava un
+ * gap reale: ORSET.ADD/ORSET.REMOVE esistevano già ma non c'era alcun
+ * modo per un client di leggere il contenuto del set (solo scrittura
+ * cieca). Usa orset_deserialize (stessa API reale di orset_callback)
+ * e itera ORSetEntry saltando gli elementi con is_removed=1. */
+void orsetMembersCommand(client *c) {
+    if (!global_nexstorage) {
+        addReplyError(c, "NexStorage non inizializzato");
+        return;
+    }
+    sds key = objectGetVal(c->argv[1]);
+    NexEntry entry = {0};
+    NexStorageResult res = nexstorage_get(global_nexstorage, key, sdslen(key), &entry);
+
+    if (res == NEXS_NOT_FOUND) {
+        addReplyArrayLen(c, 0);
+        return;
+    }
+    if (res != NEXS_OK || entry.type != NEXDT_CRDT) {
+        addReplyError(c, "Chiave non trovata o non è un ORSet");
+        return;
+    }
+
+    ORSet *s = orset_deserialize(entry.value, entry.value_len, g_nexcache_node_id);
+    if (!s) {
+        addReplyError(c, "Deserializzazione ORSet fallita");
+        return;
+    }
+
+    uint32_t live = 0;
+    for (uint32_t i = 0; i < s->count; i++) {
+        if (!s->entries[i].is_removed) live++;
+    }
+
+    addReplyArrayLen(c, live);
+    for (uint32_t i = 0; i < s->count; i++) {
+        if (s->entries[i].is_removed) continue;
+        addReplyBulkCBuffer(c, s->entries[i].value, s->entries[i].value_len);
+    }
+    orset_destroy(s);
 }
 
 void lwwGetCommand(client *c) {

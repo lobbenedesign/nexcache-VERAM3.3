@@ -35,6 +35,7 @@ VLLManager *vll_create(uint32_t table_size) {
     mgr->pattern_count = 0;
 
     pthread_mutex_init(&mgr->stats_lock, NULL);
+    pthread_mutex_init(&mgr->table_lock, NULL);
 
     fprintf(stderr,
             "[NexCache VLL] Init: table_size=%u\n"
@@ -71,7 +72,11 @@ static void vll_sort_keys(VLLManager *mgr, VLLRequest *req) {
     /* Check pattern storico: c'è un'alternativa con meno conflitti? */
     /* Per ora: il sort per hash è già ottimale */
     (void)mgr; /* Usato in future versioni con pattern graph */
-    mgr->stats.predictive_reorders++;
+    /* PRIMA: incremento non atomico su stato condiviso, chiamato prima
+     * di acquisire table_lock — scoperto con ThreadSanitizer durante la
+     * costruzione della test suite per SOVEREIGN (stesso codice
+     * condiviso): data race reale sotto contesa multi-thread. */
+    __atomic_fetch_add(&mgr->stats.predictive_reorders, 1, __ATOMIC_RELAXED);
 }
 
 /* ── vll_acquire ────────────────────────────────────────────── */
@@ -80,6 +85,29 @@ VLLStatus vll_acquire(VLLManager *mgr, VLLRequest *req) {
 
     /* Ordina le chiavi per evitare deadlock */
     vll_sort_keys(mgr, req);
+
+    /* Compatta le chiavi per slot: una transazione non deve mai
+     * confliggere con i propri lock. Chiavi duplicate (es. SET+GET
+     * sulla stessa chiave) o slot in collisione vengono fusi in
+     * un'unica entry; il write lock vince sul read lock. */
+    uint16_t compact = 0;
+    for (int i = 0; i < req->num_keys; i++) {
+        uint32_t slot = key_to_slot(mgr, req->keys[i].key_hash);
+        int found = -1;
+        for (int j = 0; j < compact; j++) {
+            if (key_to_slot(mgr, req->keys[j].key_hash) == slot) {
+                found = j;
+                break;
+            }
+        }
+        if (found >= 0) {
+            if (req->keys[i].lock_type == VLL_LOCK_WRITE)
+                req->keys[found].lock_type = VLL_LOCK_WRITE;
+        } else {
+            req->keys[compact++] = req->keys[i];
+        }
+    }
+    req->num_keys = compact;
 
     req->submit_us = vll_us_now();
     uint64_t deadline = req->submit_us + VLL_TIMEOUT_US;
@@ -90,6 +118,7 @@ VLLStatus vll_acquire(VLLManager *mgr, VLLRequest *req) {
         int conflict = 0;
         int acquired_count = 0;
 
+        pthread_mutex_lock(&mgr->table_lock);
         for (int i = 0; i < req->num_keys; i++) {
             uint32_t slot = key_to_slot(mgr, req->keys[i].key_hash);
 
@@ -114,6 +143,7 @@ VLLStatus vll_acquire(VLLManager *mgr, VLLRequest *req) {
         }
 
         if (!conflict) {
+            pthread_mutex_unlock(&mgr->table_lock);
             /* Tutti i lock acquisiti */
             req->status = VLL_OK;
             req->acquired_us = vll_us_now();
@@ -128,7 +158,8 @@ VLLStatus vll_acquire(VLLManager *mgr, VLLRequest *req) {
             return VLL_OK;
         }
 
-        /* Rilascia i lock parzialmente acquisiti */
+        /* Rilascia i lock parzialmente acquisiti (ancora sotto table_lock:
+         * sono le stesse strutture appena mutate sopra). */
         for (int i = 0; i < acquired_count; i++) {
             uint32_t slot = key_to_slot(mgr, req->keys[i].key_hash);
             if (req->keys[i].lock_type == VLL_LOCK_READ) {
@@ -137,6 +168,7 @@ VLLStatus vll_acquire(VLLManager *mgr, VLLRequest *req) {
                 mgr->write_flags[slot] = 0;
             }
         }
+        pthread_mutex_unlock(&mgr->table_lock);
 
         /* Timeout check */
         if (vll_us_now() >= deadline) {
@@ -159,6 +191,7 @@ VLLStatus vll_acquire(VLLManager *mgr, VLLRequest *req) {
 void vll_release(VLLManager *mgr, VLLRequest *req) {
     if (!mgr || !req || req->status != VLL_OK) return;
 
+    pthread_mutex_lock(&mgr->table_lock);
     for (int i = 0; i < req->num_keys; i++) {
         uint32_t slot = key_to_slot(mgr, req->keys[i].key_hash);
         if (req->keys[i].lock_type == VLL_LOCK_READ) {
@@ -167,6 +200,7 @@ void vll_release(VLLManager *mgr, VLLRequest *req) {
             mgr->write_flags[slot] = 0;
         }
     }
+    pthread_mutex_unlock(&mgr->table_lock);
     req->status = VLL_ABORTED; /* Marking released */
 }
 
@@ -181,7 +215,11 @@ VLLRequest *vll_request_create(VLLManager *mgr,
     VLLRequest *req = (VLLRequest *)calloc(1, sizeof(VLLRequest));
     if (!req) return NULL;
 
-    req->txn_id = mgr->next_txn_id++;
+    /* PRIMA: post-increment non atomico su next_txn_id condiviso — data
+     * race reale scoperta con ThreadSanitizer (stesso codice condiviso
+     * con SOVEREIGN, dove ha causato la perdita di 10 incrementi su
+     * 16000 in un test di stress senza TSan). */
+    req->txn_id = __atomic_fetch_add(&mgr->next_txn_id, 1, __ATOMIC_RELAXED);
     req->num_keys = num_keys;
     for (int i = 0; i < num_keys; i++) {
         req->keys[i].key_hash = key_hashes[i];
@@ -233,5 +271,6 @@ void vll_destroy(VLLManager *mgr) {
     free(mgr->write_flags);
     free(mgr->patterns);
     pthread_mutex_destroy(&mgr->stats_lock);
+    pthread_mutex_destroy(&mgr->table_lock);
     free(mgr);
 }

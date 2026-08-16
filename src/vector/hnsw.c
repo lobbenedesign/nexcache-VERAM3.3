@@ -104,17 +104,36 @@ typedef struct {
     hnsw_id_t id;
 } HeapNode;
 
-static void heap_push(HeapNode *heap, int *size, float dist, hnsw_id_t id) {
+/* PRIMA: heap_push scriveva su heap[(*size)++] senza alcun controllo di
+ * capacità. Il buffer 'candidates' in search_layer viene allocato con
+ * capacità ef*4+4 (pensata per il caso comune), ma la fase di beam
+ * search può spingere fino a M_max0 (fino a 32+ vicini per nodo a
+ * layer 0) nuovi candidati in una singola espansione, prima che il
+ * prossimo heap_pop liberi spazio — con ef=1 (usato nella discesa di
+ * Fase 1 sia in hnsw_add che in hnsw_search, capacità=8) un nodo ad alto
+ * grado supera facilmente la capacità: scrittura oltre i limiti
+ * dell'array (heap overflow). ORA: cresce dinamicamente come un
+ * normale vector, invece di assumere un limite superiore che la beam
+ * search può violare. */
+static void heap_push(HeapNode **heap, int *size, int *cap, float dist, hnsw_id_t id) {
+    if (*size >= *cap) {
+        int new_cap = *cap > 0 ? *cap * 2 : 8;
+        HeapNode *nh = (HeapNode *)realloc(*heap, (size_t)new_cap * sizeof(HeapNode));
+        if (!nh) return; /* Meglio scartare il candidato che corrompere memoria */
+        *heap = nh;
+        *cap = new_cap;
+    }
+    HeapNode *h = *heap;
     int i = (*size)++;
-    heap[i].dist = dist;
-    heap[i].id = id;
+    h[i].dist = dist;
+    h[i].id = id;
     /* Bubble up */
     while (i > 0) {
         int parent = (i - 1) / 2;
-        if (heap[parent].dist > heap[i].dist) {
-            HeapNode tmp = heap[parent];
-            heap[parent] = heap[i];
-            heap[i] = tmp;
+        if (h[parent].dist > h[i].dist) {
+            HeapNode tmp = h[parent];
+            h[parent] = h[i];
+            h[i] = tmp;
             i = parent;
         } else
             break;
@@ -235,9 +254,11 @@ static int search_layer(HNSWIndex *idx,
                         int layer,
                         HeapNode *results,
                         int max_results) {
-    /* Candidates: min-heap per priorità ricerca */
-    HeapNode *candidates = (HeapNode *)malloc(
-        (size_t)(ef * 4 + 4) * sizeof(HeapNode));
+    /* Candidates: min-heap per priorità ricerca. Capacità iniziale
+     * ef*4+4 come stima, ma cresce dinamicamente in heap_push — vedi
+     * commento su heap_push per il motivo (overflow altrimenti). */
+    int cand_cap = ef * 4 + 4;
+    HeapNode *candidates = (HeapNode *)malloc((size_t)cand_cap * sizeof(HeapNode));
     if (!candidates) return 0;
 
     /* Risultati: max-heap per mantenere top-ef vicini */
@@ -262,7 +283,7 @@ static int search_layer(HNSWIndex *idx,
     float dist_ep = compute_distance(idx, query_vec,
                                      idx->nodes[entry_id].vector);
 
-    heap_push(candidates, &cand_size, dist_ep, entry_id);
+    heap_push(&candidates, &cand_size, &cand_cap, dist_ep, entry_id);
     maxheap_push(result_heap, &res_size, dist_ep, entry_id);
 
     size_t entry_byte = entry_id / 8;
@@ -295,7 +316,7 @@ static int search_layer(HNSWIndex *idx,
                                              idx->nodes[nb_id].vector);
 
             if (res_size < ef || dist_nb < result_heap[0].dist) {
-                heap_push(candidates, &cand_size, dist_nb, nb_id);
+                heap_push(&candidates, &cand_size, &cand_cap, dist_nb, nb_id);
                 maxheap_push(result_heap, &res_size, dist_nb, nb_id);
                 if (res_size > ef) {
                     maxheap_pop(result_heap, &res_size); /* Rimuovi il peggiore */

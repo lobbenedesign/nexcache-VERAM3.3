@@ -67,6 +67,12 @@ typedef struct ClusterIndex {
     int slot_to_node[CLUSTER_SLOT_COUNT]; /* Mappa diretta */
     ClusterStats stats;
     pthread_rwlock_t rwlock;
+    /* Protegge stats.key_lookups/avg_lookup_us, aggiornati fuori dal
+     * rwlock principale sul percorso caldo di cluster_key_to_node (per
+     * non serializzare ogni lookup di chiave su un wrlock). Un mutex
+     * dedicato piccolo, mai tenuto durante il lookup dello slot vero e
+     * proprio. */
+    pthread_mutex_t stats_lock;
 } ClusterIndex;
 
 /* ── API pubblica ───────────────────────────────────────────── */

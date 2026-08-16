@@ -1,5 +1,27 @@
 /* NexCache Work Stealing Scheduler — MODULO 3b (v2.0)
  * ============================================================
+ * STATO ATTUALE: NON COLLEGATO al percorso di dispatch reale — nessuna
+ * funzione di questo modulo (scheduler_create/try_steal/
+ * update_utilization/print_stats) è chiamata da alcun punto del
+ * codebase al di fuori di scheduler.c stesso (verificato con grep
+ * globale). Inoltre opera su cmd_head/cmd_tail/cmd_ring (NexWorker in
+ * engine.h), campi che engine.c inizializza ma non tocca mai altrove: il
+ * dispatch reale (engine_dispatch_cmd/worker_thread_main) usa
+ * esclusivamente la coda MPSC lock-free cmd_queue. Il risultato è che,
+ * se mai qualcuno chiamasse scheduler_try_steal, il primo controllo di
+ * profondità coda (`v_head <= v_tail + SCHED_STEAL_THRESHOLD`) sarebbe
+ * sempre vero (0 <= 0 + soglia) e la funzione non ruberebbe mai nulla,
+ * indipendentemente dallo squilibrio di carico reale sulla coda MPSC.
+ * Le statistiche esposte (steals, rebalances, queue_depth) sarebbero
+ * quindi sempre a zero — non fidarsi di questo modulo per bilanciamento
+ * di carico reale finché non viene ricollegato. Ricollegarlo richiede o
+ * (a) una vera coda work-stealing per worker (deque SPMC) al posto/in
+ * aggiunta della MPSC, oppure (b) un adattamento dell'algoritmo per
+ * operare direttamente sulla MPSC — nessuna delle due è stata tentata
+ * qui: è un cambio di struttura dati sul percorso di dispatch caldo,
+ * troppo rischioso da fare senza test di concorrenza dedicati (che oggi
+ * non esistono per questo modulo).
+ *
  * Bilancia automaticamente il carico tra i worker senza configurazione.
  *
  * Il problema:

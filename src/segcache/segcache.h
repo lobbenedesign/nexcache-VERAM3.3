@@ -118,9 +118,22 @@ typedef struct NexSegcache {
     size_t max_memory;
     _Atomic size_t used_memory;
 
-    /* Multi-Lock Architecture */
-    pthread_mutex_t locks[NEX_RCU_SHARDS];
+    /* Multi-Lock Architecture.
+     * NEX: rwlock (was mutex) so concurrent GETs on the same shard proceed in
+     * parallel across IO threads. Writers (set/del/expire) still exclude. */
+    pthread_rwlock_t locks[NEX_RCU_SHARDS];
     int running;
+
+    /* Reaper: chiama segcache_expire_segments() periodicamente. Senza di
+     * esso i segmenti scaduti non vengono mai restituiti al pool libero
+     * (nessun altro punto del codebase chiamava questa funzione, e il
+     * design lazy-reclaim su GET/exists non mutando il bucket sotto read
+     * lock — corretto per la concorrenza — significa che neanche le
+     * letture liberano segmenti), quindi una volta esaurito il pool ogni
+     * SET fallisce permanentemente con "Out of segments" anche se la
+     * maggior parte dei dati è scaduta da tempo. Vedi
+     * segcache_reaper_thread in segcache.c. */
+    pthread_t reaper_thread;
 
     /* Statistiche per shard (zero contesa in update) */
     SegStats shard_stats[NEX_RCU_SHARDS];

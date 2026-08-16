@@ -32,6 +32,20 @@ endif
 ifneq ($(OPTIMIZATION),-O0)
 	OPTIMIZATION+=-fno-omit-frame-pointer
 endif
+# NEX-FIX: mancava la riga che assegna OPTIMIZATION a OPT (OPT è la variabile
+# realmente usata più sotto in FINAL_CFLAGS). Senza questa riga -O3 e
+# -DRUBIN_MODE non venivano MAI applicati in nessuna build (verificato con
+# `make V=1`), nonostante dichiarati come intenzione fin dalla riga 24 —
+# stesso identico bug trovato su SOVEREIGN. A differenza di SOVEREIGN però,
+# qui `objectGetKey()` (object.c) NON dipende da RUBIN_MODE — legge sempre
+# nello stesso modo indipendentemente dal ramo di allocazione/embedding
+# usato in scrittura (objectEmbeddedData() è l'unica funzione chiamata da
+# entrambi i lati, quindi write e read non possono mai disallinearsi).
+# Verificato con test funzionali diretti (SET/GET/overwrite/DEL/KEYS su
+# server appena avviato) e con la test suite completa (41+30+ALL+ALL+13+13)
+# che RUBIN_MODE realmente attivo qui è sicuro, a differenza di SOVEREIGN
+# dove lo stesso identico fix esponeva un secondo crash mai risolto.
+OPT=$(OPTIMIZATION)
 DEPENDENCY_TARGETS=libnexcache linenoise hdr_histogram fpconv
 NODEPS:=clean distclean
 
@@ -78,9 +92,25 @@ ifeq ($(uname_S),Linux)
 	MALLOC=jemalloc
 endif
 
-# NEX-VERA: SVE2 and ARM v9-A optimizations
+# NEX-VERA: ARM64 build flags.
+# PRIMA: -march=armv9-a+sve2 veniva applicato incondizionatamente a
+# QUALUNQUE build Linux aarch64/armv*, indipendentemente dalla CPU reale
+# che eseguirà il binario. Il codice che sfrutta SVE2 (bitops.c
+# popcountSVE2, gated solo da HAVE_ARM_SVE2 a compile-time, nessun check
+# runtime HWCAP) va quindi in SIGILL se il binario viene distribuito su
+# una CPU ARM64 senza SVE2 (Graviton2/3, Ampere Altra, Raspberry Pi —
+# praticamente qualunque ARM64 non-server-di-ultima-generazione), mentre
+# il buildatore poteva benissimo avere SVE2 (es. Graviton4). Il flag
+# forzava anche l'intero binario a quella ISA extension, non solo i
+# kernel che la usano davvero.
+# ORA: baseline portabile (nessun -march specifico oltre a -funwind-tables
+# per lo stack unwinding). Il dispatch SVE2/NEON è deciso a runtime da
+# arm_hwcap_probe() (memory/arch_probe.c) con verifica getauxval(AT_HWCAP)
+# prima di eseguire path SVE2, invece che dedotto dal solo flag di
+# compilazione — stesso pattern già usato correttamente per AVX2/AVX-512
+# su x86 in questo codebase (util.c, hyperloglog.c via __builtin_cpu_supports).
 ifneq (,$(filter aarch64 armv%,$(uname_M)))
-        CFLAGS+=-funwind-tables -march=armv9-a+sve2
+        CFLAGS+=-funwind-tables
 endif
 
 # Backwards compatibility for selecting an allocator
@@ -266,11 +296,14 @@ else
 
 	current_dir = $(shell pwd)
 	FINAL_CFLAGS+=-DLUA_ENABLED -DLUA_LIB=libnexcachelua.so
+# NEX-FIX: come su SOVEREIGN, current_dir contiene spazi/parentesi sul path
+# di questo progetto — quotare l'intero flag evita un syntax error di shell
+# nel comando di LINK.
 ifeq ($(uname_S),Darwin)
-	FINAL_LDFLAGS+= -Wl,-rpath,$(PREFIX)/lib
-	FINAL_LDFLAGS+= -Wl,-rpath,$(current_dir)/modules/lua
+	FINAL_LDFLAGS+= '-Wl,-rpath,$(PREFIX)/lib'
+	FINAL_LDFLAGS+= '-Wl,-rpath,$(current_dir)/modules/lua'
 else
-	FINAL_LDFLAGS+= -Wl,-rpath,$(PREFIX)/lib:$(current_dir)/modules/lua -Wl,--disable-new-dtags
+	FINAL_LDFLAGS+= '-Wl,-rpath,$(PREFIX)/lib:$(current_dir)/modules/lua' -Wl,--disable-new-dtags
 endif
 endif
 
@@ -684,26 +717,27 @@ endif
 all-with-unit-tests: all $(ENGINE_UNIT_GTESTS)
 .PHONY: all
 
+# NEX-FIX: stesso bug di quoting di SOVEREIGN — vedi commento lì.
 persist-settings: distclean
-	echo STD=$(STD) >> .make-settings
-	echo WARN=$(WARN) >> .make-settings
-	echo OPT=$(OPT) >> .make-settings
-	echo PROG_SUFFIX=$(PROG_SUFFIX) >> .make-settings
-	echo MALLOC=$(MALLOC) >> .make-settings
-	echo BUILD_TLS=$(BUILD_TLS) >> .make-settings
-	echo BUILD_RDMA=$(BUILD_RDMA) >> .make-settings
-	echo USE_SYSTEMD=$(USE_SYSTEMD) >> .make-settings
-	echo BUILD_LUA=$(BUILD_LUA) >> .make-settings
-	echo USE_FAST_FLOAT=$(USE_FAST_FLOAT) >> .make-settings
-	echo USE_LIBBACKTRACE=$(USE_LIBBACKTRACE) >> .make-settings
-	echo LIBBACKTRACE_PREFIX=$(LIBBACKTRACE_PREFIX) >> .make-settings
-	echo CFLAGS=$(CFLAGS) >> .make-settings
-	echo LDFLAGS=$(LDFLAGS) >> .make-settings
-	echo SERVER_CFLAGS=$(SERVER_CFLAGS) >> .make-settings
-	echo SERVER_LDFLAGS=$(SERVER_LDFLAGS) >> .make-settings
-	echo PREV_FINAL_CFLAGS=$(FINAL_CFLAGS) >> .make-settings
-	echo PREV_FINAL_LDFLAGS=$(FINAL_LDFLAGS) >> .make-settings
-	echo ENGINE_SERVER_OBJ=$(ENGINE_SERVER_OBJ) >> .make-settings
+	echo "STD=$(STD)" >> .make-settings
+	echo "WARN=$(WARN)" >> .make-settings
+	echo "OPT=$(OPT)" >> .make-settings
+	echo "PROG_SUFFIX=$(PROG_SUFFIX)" >> .make-settings
+	echo "MALLOC=$(MALLOC)" >> .make-settings
+	echo "BUILD_TLS=$(BUILD_TLS)" >> .make-settings
+	echo "BUILD_RDMA=$(BUILD_RDMA)" >> .make-settings
+	echo "USE_SYSTEMD=$(USE_SYSTEMD)" >> .make-settings
+	echo "BUILD_LUA=$(BUILD_LUA)" >> .make-settings
+	echo "USE_FAST_FLOAT=$(USE_FAST_FLOAT)" >> .make-settings
+	echo "USE_LIBBACKTRACE=$(USE_LIBBACKTRACE)" >> .make-settings
+	echo "LIBBACKTRACE_PREFIX=$(LIBBACKTRACE_PREFIX)" >> .make-settings
+	echo "CFLAGS=$(CFLAGS)" >> .make-settings
+	echo "LDFLAGS=$(LDFLAGS)" >> .make-settings
+	echo "SERVER_CFLAGS=$(SERVER_CFLAGS)" >> .make-settings
+	echo "SERVER_LDFLAGS=$(SERVER_LDFLAGS)" >> .make-settings
+	echo "PREV_FINAL_CFLAGS=$(FINAL_CFLAGS)" >> .make-settings
+	echo "PREV_FINAL_LDFLAGS=$(FINAL_LDFLAGS)" >> .make-settings
+	echo "ENGINE_SERVER_OBJ=$(ENGINE_SERVER_OBJ)" >> .make-settings
 	-(cd ../deps && $(MAKE) $(DEPENDENCY_TARGETS))
 
 .PHONY: persist-settings

@@ -205,7 +205,9 @@ int engine_dispatch_cmd(NexEngine *engine, NexCmd *cmd, const char *key, size_t 
 
 /**
  * engine_worker_for_key - Determina quale worker gestisce una chiave.
- * Usa CRC16 compatibile con NexCache Cluster.
+ * Usa DJB2 per lo sharding locale tra i worker di questo processo (NON
+ * CRC16 — è uno sharding interno al processo, diverso dallo slot-routing
+ * a 16384 slot di Redis/NexCache Cluster, che usa crc16() da crc16.c).
  */
 int engine_worker_for_key(NexEngine *engine, const char *key, size_t keylen);
 

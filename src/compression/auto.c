@@ -129,11 +129,26 @@ size_t compress_estimate_bound(size_t src_size, CompressionType comp_type) {
     }
 }
 
-/* ── XOR checksum semplice ──────────────────────────────────── */
-static uint8_t xor_checksum(const uint8_t *data, size_t len) {
-    uint8_t cs = 0;
-    for (size_t i = 0; i < len; i++) cs ^= data[i];
-    return cs;
+/* ── CRC32 (IEEE 802.3) ──────────────────────────────────────── */
+static uint32_t crc32_table[256];
+static int crc32_table_ready = 0;
+
+static void crc32_init_table(void) {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++)
+            c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        crc32_table[i] = c;
+    }
+    crc32_table_ready = 1;
+}
+
+static uint32_t crc32_checksum(const uint8_t *data, size_t len) {
+    if (!crc32_table_ready) crc32_init_table();
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++)
+        c = crc32_table[(c ^ data[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
 }
 
 /* ── compress_data ──────────────────────────────────────────── */
@@ -186,13 +201,32 @@ ssize_t compress_data(const uint8_t *src,
             compressed_size = (ssize_t)src_size;
         }
         break;
-    default:
-        /* Stub: copia raw (in produzione usa librerie reali) */
+    default: {
+        /* PRIMA: quando LZ4/Zstd non sono linkati (default in questa build,
+         * dato che nessun HAVE_LZ4/HAVE_ZSTD è definito), compress_data
+         * cadeva silenziosamente qui, faceva un memcpy e riportava
+         * compressed_size==src_size — il controllo "risparmio <10%" subito
+         * sotto scattava quindi SEMPRE, e compress_data ritornava 0 (nessuna
+         * compressione) per ogni chiamata, senza alcun segnale a runtime
+         * oltre al log a compression_init(). Un operatore che vede i log
+         * "compressione abilitata" può facilmente non accorgersi che in
+         * realtà non comprime mai nulla. Avvisa (una sola volta, per non
+         * floodare i log sul percorso caldo) quando questo accade davvero. */
+        static int warned_stub = 0;
+        if (!warned_stub) {
+            fprintf(stderr,
+                    "[NexCache Compression] WARNING: LZ4/Zstd non linkati — "
+                    "compress_data opera in modalità stub (nessuna compressione "
+                    "reale verrà applicata). Compilare con HAVE_LZ4/HAVE_ZSTD per "
+                    "produzione.\n");
+            warned_stub = 1;
+        }
         if (src_size <= payload_cap) {
             memcpy(payload, src, src_size);
             compressed_size = (ssize_t)src_size;
         }
         break;
+    }
     }
 
     if (compressed_size <= 0) return -1;
@@ -211,7 +245,7 @@ ssize_t compress_data(const uint8_t *src,
     hdr->comp_type = (uint8_t)comp_type;
     hdr->data_type = (uint8_t)data_type;
     hdr->level = ZSTD_LEVEL_DEFAULT;
-    hdr->checksum = xor_checksum(payload, (size_t)compressed_size);
+    hdr->checksum = crc32_checksum(payload, (size_t)compressed_size);
 
     uint64_t elapsed = comp_us_now() - t0;
 
@@ -256,9 +290,9 @@ ssize_t decompress_data(const uint8_t *src,
     size_t payload_size = src_size - sizeof(CompressedHeader);
 
     /* Verifica checksum */
-    uint8_t cs = xor_checksum(payload, payload_size);
+    uint32_t cs = crc32_checksum(payload, payload_size);
     if (cs != hdr->checksum) {
-        fprintf(stderr, "[NexCache Compression] Checksum mismatch: %02X != %02X\n",
+        fprintf(stderr, "[NexCache Compression] Checksum mismatch: %08X != %08X\n",
                 cs, hdr->checksum);
         return -1;
     }
@@ -326,8 +360,20 @@ ssize_t delta_encode(const double *values, size_t count, uint8_t *out, size_t ou
     double prev = values[0];
     for (size_t i = 1; i < count; i++) {
         double delta = values[i] - prev;
-        /* ZigZag encoding: mappa negativi→positivi */
-        int32_t d = (int32_t)(delta * 1000.0); /* 3 decimali */
+        /* PRIMA: (int32_t)(delta*1000.0) è undefined behavior in C quando
+         * il risultato eccede il range di int32_t (|delta| oltre
+         * ~2.147e6, un salto realistico per un time series generico con
+         * questo compressore) — e "d*2" nella zigzag poteva overflow una
+         * seconda volta. In pratica: input con salti ampi producevano
+         * output silenziosamente sbagliato/indefinito invece di un errore
+         * o una gestione esplicita. Clampiamo al range rappresentabile
+         * (perdita di precisione dichiarata sul singolo campione estremo,
+         * ma nessun UB) invece di castare un double fuori range. */
+        double scaled = delta * 1000.0; /* 3 decimali */
+        const double d_limit = (double)(INT32_MAX / 2 - 1);
+        if (scaled > d_limit) scaled = d_limit;
+        if (scaled < -d_limit) scaled = -d_limit;
+        int32_t d = (int32_t)scaled;
         uint32_t z = (d >= 0) ? (uint32_t)(d * 2) : (uint32_t)((-d * 2) - 1);
         *(uint32_t *)p = z;
         p += sizeof(uint32_t);

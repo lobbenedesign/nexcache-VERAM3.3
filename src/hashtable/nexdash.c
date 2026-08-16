@@ -9,6 +9,10 @@
 #include <sys/time.h>
 #include <math.h>
 
+/* Byte di overhead per-entry usati per l'accounting di used_memory oltre al
+ * value_size esplicito (slot + probabile allocazione header lato chiamante). */
+#define NEXDASH_ENTRY_OVERHEAD 32
+
 static uint64_t nd_us_now(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -81,6 +85,9 @@ NexDashTable *nexdash_create(size_t initial_segments, size_t max_memory) {
     /* COMPLIANCE v5: Blocked Bloom Filter */
     t->bloom = nexbloom_create(nsegs * NEXDASH_SEGMENT_ITEMS, 0.01);
 
+    pthread_mutex_init(&t->lock, NULL);
+    t->free_cb = NULL;
+
     fprintf(stderr,
             "[NexCache NexDash] Created: segs=%u max_mem=%zuMB\n"
             "  Compliance v5: 24-byte slots + Tagged Pointers + Blocked Bloom\n",
@@ -88,7 +95,116 @@ NexDashTable *nexdash_create(size_t initial_segments, size_t max_memory) {
     return t;
 }
 
+/* Libera (via free_cb) il value di uno slot occupato e ne azzera l'entry.
+ * Il chiamante deve tenere t->lock e aggiornare seg/t->item_count. */
+static void nd_release_slot(NexDashTable *t, NexDashSlot *sl) {
+    void *old = TAG_GET_ADDR(sl->value_ptr);
+    uint8_t old_type = TAG_GET_TYPE(sl->value_ptr);
+    if (old && old_type != NTYPE_DELETED && t->free_cb) t->free_cb(old);
+    size_t freed = (size_t)sl->value_size + NEXDASH_ENTRY_OVERHEAD;
+    t->used_memory = (t->used_memory > freed) ? (t->used_memory - freed) : 0;
+    sl->value_ptr = TAG_SET_META(NULL, 0, NTYPE_DELETED, TIER_PROBATORY, 0);
+    sl->value_size = 0;
+}
+
+/* Cerca uno slot libero nel segmento (a partire da bkt_start) e vi inserisce
+ * la chiave. Ritorna lo slot creato o NULL se il segmento è pieno.
+ * Il chiamante deve tenere t->lock. */
+static NexDashSlot *nd_insert_into_segment(NexDashTable *t, NexDashSegment *seg, uint32_t bkt_start,
+                                            uint64_t hash, const char *key, uint8_t key_len) {
+    for (uint32_t probe = 0; probe < NEXDASH_BUCKET_COUNT; probe++) {
+        uint32_t bi = (bkt_start + probe) % NEXDASH_BUCKET_COUNT;
+        NexDashBucket *bkt = &seg->buckets[bi];
+        for (int s = 0; s < NEXDASH_SLOT_COUNT; s++) {
+            if ((bkt->occupancy >> s) & 1) continue;
+
+            NexDashSlot *sl = &bkt->slots[s];
+            memset(sl, 0, sizeof(*sl));
+            sl->key_hash = hash;
+
+            if (key) {
+                if (t->key_pool_size + key_len + 1 > t->key_pool_cap) {
+                    while (t->key_pool_size + key_len + 1 > t->key_pool_cap)
+                        t->key_pool_cap *= 2;
+                    uint8_t *np = (uint8_t *)realloc(t->key_pool, t->key_pool_cap);
+                    if (!np) return NULL;
+                    t->key_pool = np;
+                }
+                sl->key_offset = t->key_pool_size;
+                memcpy(t->key_pool + t->key_pool_size, key, key_len);
+                t->key_pool[t->key_pool_size + key_len] = '\0';
+                t->key_pool_size += key_len + 1;
+            }
+
+            /* Inizializza TaggedPtr con KeyLen e metadati base */
+            sl->value_ptr = TAG_SET_META(NULL, key_len, NTYPE_STRING, TIER_PROBATORY, 0);
+
+            seg->item_count++;
+            t->item_count++;
+            seg->version = t->current_version;
+            seg->last_modified = nd_us_now();
+
+            if (key && t->bloom) nexbloom_add(t->bloom, hash);
+            bkt->occupancy |= (1U << s);
+            return sl;
+        }
+    }
+    return NULL;
+}
+
+/* Raddoppia la directory e rehasha tutte le entry esistenti nella nuova
+ * capacità. Il chiamante deve tenere t->lock. Ritorna 0 se l'allocazione
+ * fallisce (in tal caso la tabella resta invariata e consistente). */
+static int nd_resize(NexDashTable *t) {
+    uint32_t new_dir_size = t->dir_size * 2;
+    if (new_dir_size <= t->dir_size) return 0; /* overflow guard */
+
+    NexDashSegment **new_dir = ARENA_NEW_ARRAY_ZERO(t->arena, NexDashSegment *, new_dir_size);
+    if (!new_dir) return 0;
+    for (uint32_t i = 0; i < new_dir_size; i++) {
+        new_dir[i] = ARENA_NEW_ZERO(t->arena, NexDashSegment);
+        if (!new_dir[i]) return 0; /* arena non supporta free: la tabella resta valida sulla vecchia directory */
+    }
+
+    for (uint32_t si = 0; si < t->dir_size; si++) {
+        NexDashSegment *old_seg = t->directory[si];
+        for (int bi = 0; bi < NEXDASH_BUCKET_COUNT; bi++) {
+            NexDashBucket *bkt = &old_seg->buckets[bi];
+            for (int s = 0; s < NEXDASH_SLOT_COUNT; s++) {
+                if (!((bkt->occupancy >> s) & 1)) continue;
+                NexDashSlot *old_sl = &bkt->slots[s];
+                uint32_t nseg_idx = (uint32_t)(old_sl->key_hash % new_dir_size);
+                uint32_t nbkt_start = (uint32_t)((old_sl->key_hash >> 10) % NEXDASH_BUCKET_COUNT);
+                NexDashSegment *nseg = new_dir[nseg_idx];
+                NexDashSlot *placed = nd_insert_into_segment(t, nseg, nbkt_start, old_sl->key_hash, NULL, 0);
+                if (!placed) {
+                    /* Non dovrebbe accadere (capacità raddoppiata): se succede per un
+                     * pattern di hash avverso, l'entry viene comunque preservata
+                     * copiandola una volta di più con probing esteso è fuori scope;
+                     * qui la segnaliamo invece di perdere silenziosamente il dato. */
+                    fprintf(stderr, "[NexCache NexDash] WARNING: resize rehash overflow su segmento %u\n", nseg_idx);
+                    continue;
+                }
+                /* nd_insert_into_segment ha già copiato key_hash e incrementato i
+                 * contatori; ripristiniamo key_offset/value_ptr/expire/value_size
+                 * dall'entry originale (chiave già presente nel key_pool condiviso). */
+                placed->key_offset = old_sl->key_offset;
+                placed->value_ptr = old_sl->value_ptr;
+                placed->expire_us32 = old_sl->expire_us32;
+                placed->value_size = old_sl->value_size;
+            }
+        }
+    }
+
+    t->directory = new_dir;
+    t->dir_size = new_dir_size;
+    t->dir_cap = new_dir_size;
+    t->stats.resizes++;
+    return 1;
+}
+
 /* ── Lookup con probing lineare e Tagged Pointers ─────────── */
+/* Il chiamante deve tenere t->lock. */
 static NexDashSlot *nd_find_slot(NexDashTable *t, const char *key, uint8_t key_len, uint64_t hash, int create_if_missing) {
     uint32_t seg_idx = (uint32_t)(hash % t->dir_size);
     NexDashSegment *seg = t->directory[seg_idx];
@@ -111,8 +227,8 @@ static NexDashSlot *nd_find_slot(NexDashTable *t, const char *key, uint8_t key_l
             if (sl->expire_us32 != 0) {
                 uint64_t exp = decode_expire(sl->expire_us32);
                 if (exp <= nd_us_now()) {
+                    nd_release_slot(t, sl);
                     bkt->occupancy &= ~(1U << s);
-                    sl->value_ptr = TAG_SET_META(NULL, 0, NTYPE_DELETED, TIER_PROBATORY, 0);
                     seg->item_count--;
                     t->item_count--;
                     return NULL;
@@ -125,64 +241,71 @@ static NexDashSlot *nd_find_slot(NexDashTable *t, const char *key, uint8_t key_l
     if (!create_if_missing) return NULL;
 
     /* FASE 2: non trovata — crea slot */
-    for (uint32_t probe = 0; probe < NEXDASH_BUCKET_COUNT; probe++) {
-        uint32_t bi = (bkt_start + probe) % NEXDASH_BUCKET_COUNT;
-        NexDashBucket *bkt = &seg->buckets[bi];
-        for (int s = 0; s < NEXDASH_SLOT_COUNT; s++) {
-            if ((bkt->occupancy >> s) & 1) continue;
+    NexDashSlot *sl = nd_insert_into_segment(t, seg, bkt_start, hash, key, key_len);
+    if (sl) return sl;
 
-            NexDashSlot *sl = &bkt->slots[s];
-            memset(sl, 0, sizeof(*sl));
-            sl->key_hash = hash;
-
-            if (t->key_pool_size + key_len + 1 > t->key_pool_cap) {
-                while (t->key_pool_size + key_len + 1 > t->key_pool_cap)
-                    t->key_pool_cap *= 2;
-                uint8_t *np = (uint8_t *)realloc(t->key_pool, t->key_pool_cap);
-                if (!np) return NULL;
-                t->key_pool = np;
-            }
-            sl->key_offset = t->key_pool_size;
-            memcpy(t->key_pool + t->key_pool_size, key, key_len);
-            t->key_pool[t->key_pool_size + key_len] = '\0';
-            t->key_pool_size += key_len + 1;
-
-            /* Inizializza TaggedPtr con KeyLen e metadati base */
-            sl->value_ptr = TAG_SET_META(NULL, key_len, NTYPE_STRING, TIER_PROBATORY, 0);
-
-            seg->item_count++;
-            t->item_count++;
-            seg->version = t->current_version;
-            seg->last_modified = nd_us_now();
-
-            if (t->bloom) nexbloom_add(t->bloom, hash);
-            bkt->occupancy |= (1U << s);
-            return sl;
-        }
-    }
-
-    /* FASE 3: Table resizing (omessa per brevità ma logicamente simile al vecchio) */
-    return NULL;
+    /* FASE 3: segmento pieno — cresci la tabella e riprova (una sola volta:
+     * dopo il raddoppio ogni segmento originale ha metà occupazione media). */
+    if (!nd_resize(t)) return NULL;
+    seg_idx = (uint32_t)(hash % t->dir_size);
+    seg = t->directory[seg_idx];
+    bkt_start = (uint32_t)((hash >> 10) % NEXDASH_BUCKET_COUNT);
+    return nd_insert_into_segment(t, seg, bkt_start, hash, key, key_len);
 }
 
-int nexdash_set(NexDashTable *t, const char *key, uint8_t key_len, void *value, NexEntryType type, uint64_t expire_us) {
+void nexdash_set_free_cb(NexDashTable *t, NexDashFreeCb cb) {
+    if (!t) return;
+    pthread_mutex_lock(&t->lock);
+    t->free_cb = cb;
+    pthread_mutex_unlock(&t->lock);
+}
+
+void nexdash_lock(NexDashTable *t) {
+    if (t) pthread_mutex_lock(&t->lock);
+}
+
+void nexdash_unlock(NexDashTable *t) {
+    if (t) pthread_mutex_unlock(&t->lock);
+}
+
+int nexdash_set_nolock(NexDashTable *t, const char *key, uint8_t key_len, void *value, uint32_t value_size, NexEntryType type, uint64_t expire_us) {
     if (!t || !key || key_len == 0) return 0;
     uint64_t hash = fnv1a_64(key, key_len);
+
     NexDashSlot *sl = nd_find_slot(t, key, key_len, hash, 1);
     if (!sl) return 0;
+
+    /* Libera il value precedente (se overwrite) prima di sovrascrivere:
+     * senza questo ogni SET su chiave esistente perdeva memoria. */
+    void *old_addr = TAG_GET_ADDR(sl->value_ptr);
+    uint8_t old_type = TAG_GET_TYPE(sl->value_ptr);
+    if (old_addr && old_type != NTYPE_DELETED && t->free_cb) t->free_cb(old_addr);
+    size_t old_cost = old_addr ? ((size_t)sl->value_size + NEXDASH_ENTRY_OVERHEAD) : 0;
 
     uint8_t ver = TAG_GET_VER(sl->value_ptr);
     uint8_t tier = TAG_GET_TIER(sl->value_ptr);
 
     sl->value_ptr = TAG_SET_META(value, key_len, type, tier, ver);
     sl->expire_us32 = encode_expire(expire_us);
+    sl->value_size = value_size;
+
+    t->used_memory = (t->used_memory > old_cost ? t->used_memory - old_cost : 0)
+                      + value_size + NEXDASH_ENTRY_OVERHEAD;
 
     t->current_version++;
     t->stats.sets++;
     return 1;
 }
 
-void *nexdash_get(NexDashTable *t, const char *key, uint8_t key_len, NexEntryType *type_out) {
+int nexdash_set(NexDashTable *t, const char *key, uint8_t key_len, void *value, uint32_t value_size, NexEntryType type, uint64_t expire_us) {
+    if (!t) return 0;
+    pthread_mutex_lock(&t->lock);
+    int rc = nexdash_set_nolock(t, key, key_len, value, value_size, type, expire_us);
+    pthread_mutex_unlock(&t->lock);
+    return rc;
+}
+
+void *nexdash_get_nolock(NexDashTable *t, const char *key, uint8_t key_len, NexEntryType *type_out) {
     if (!t || !key || key_len == 0) {
         if (t) t->stats.misses++;
         return NULL;
@@ -215,9 +338,19 @@ void *nexdash_get(NexDashTable *t, const char *key, uint8_t key_len, NexEntryTyp
     return TAG_GET_ADDR(sl->value_ptr);
 }
 
+void *nexdash_get(NexDashTable *t, const char *key, uint8_t key_len, NexEntryType *type_out) {
+    if (!t) return NULL;
+    pthread_mutex_lock(&t->lock);
+    void *ret = nexdash_get_nolock(t, key, key_len, type_out);
+    pthread_mutex_unlock(&t->lock);
+    return ret;
+}
+
 int nexdash_del(NexDashTable *t, const char *key, uint8_t key_len) {
     if (!t || !key || key_len == 0) return 0;
     uint64_t hash = fnv1a_64(key, key_len);
+
+    pthread_mutex_lock(&t->lock);
     uint32_t seg_idx = (uint32_t)(hash % t->dir_size);
     NexDashSegment *seg = t->directory[seg_idx];
     uint32_t bkt_start = (uint32_t)((hash >> 10) % NEXDASH_BUCKET_COUNT);
@@ -232,15 +365,17 @@ int nexdash_del(NexDashTable *t, const char *key, uint8_t key_len) {
             const char *stored = (const char *)(t->key_pool + sl->key_offset);
             if (memcmp(stored, key, key_len) != 0) continue;
 
+            nd_release_slot(t, sl);
             bkt->occupancy &= ~(1U << s);
-            sl->value_ptr = TAG_SET_META(NULL, 0, NTYPE_DELETED, TIER_PROBATORY, 0);
             seg->item_count--;
             t->item_count--;
             t->current_version++;
             t->stats.dels++;
+            pthread_mutex_unlock(&t->lock);
             return 1;
         }
     }
+    pthread_mutex_unlock(&t->lock);
     return 0;
 }
 
@@ -252,14 +387,20 @@ int nexdash_exists(NexDashTable *t, const char *key, uint8_t key_len) {
 int nexdash_expire(NexDashTable *t, const char *key, uint8_t key_len, uint64_t expire_us) {
     if (!t || !key) return -1;
     uint64_t hash = fnv1a_64(key, key_len);
+    pthread_mutex_lock(&t->lock);
     NexDashSlot *sl = nd_find_slot(t, key, key_len, hash, 0);
-    if (!sl) return 0;
+    if (!sl) {
+        pthread_mutex_unlock(&t->lock);
+        return 0;
+    }
     sl->expire_us32 = encode_expire(expire_us);
+    pthread_mutex_unlock(&t->lock);
     return 1;
 }
 
 void nexdash_scan(NexDashTable *t, NexDashIterCb cb, void *ctx) {
     if (!t || !cb) return;
+    pthread_mutex_lock(&t->lock);
     uint64_t now = nd_us_now();
     for (uint32_t si = 0; si < t->dir_size; si++) {
         NexDashSegment *seg = t->directory[si];
@@ -277,14 +418,45 @@ void nexdash_scan(NexDashTable *t, NexDashIterCb cb, void *ctx) {
             }
         }
     }
+    pthread_mutex_unlock(&t->lock);
 }
 
+/* Scansiona la tabella e rimuove (liberando il value via free_cb) tutte le
+ * entry scadute, invocando cb per ciascuna prima della rimozione. Era uno
+ * stub vuoto: nessuna entry scaduta veniva mai ripulita fuori dal path
+ * lazy-expire-on-read di nd_find_slot. */
 void nexdash_scan_expired(NexDashTable *t, NexDashIterCb cb, void *ctx) {
-    /* ... simile a scan ma pulisce ... */
+    if (!t) return;
+    pthread_mutex_lock(&t->lock);
+    uint64_t now = nd_us_now();
+    for (uint32_t si = 0; si < t->dir_size; si++) {
+        NexDashSegment *seg = t->directory[si];
+        for (int bi = 0; bi < NEXDASH_BUCKET_COUNT; bi++) {
+            NexDashBucket *bkt = &seg->buckets[bi];
+            for (int s = 0; s < NEXDASH_SLOT_COUNT; s++) {
+                if (!((bkt->occupancy >> s) & 1)) continue;
+                NexDashSlot *sl = &bkt->slots[s];
+                if (sl->expire_us32 == 0 || decode_expire(sl->expire_us32) > now) continue;
+
+                if (cb) {
+                    const char *key = (const char *)(t->key_pool + sl->key_offset);
+                    cb(key, TAG_GET_LEN(sl->value_ptr), TAG_GET_ADDR(sl->value_ptr),
+                       TAG_GET_TYPE(sl->value_ptr), ctx);
+                }
+                nd_release_slot(t, sl);
+                bkt->occupancy &= ~(1U << s);
+                seg->item_count--;
+                t->item_count--;
+                t->stats.dels++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&t->lock);
 }
 
 void nexdash_destroy(NexDashTable *t) {
     if (!t) return;
+    pthread_mutex_destroy(&t->lock);
     if (t->key_pool) free(t->key_pool);
     if (t->bloom) nexbloom_destroy(t->bloom);
 
@@ -330,39 +502,61 @@ int nexdash_snapshot_end(NexDashTable *t) {
     return 0;
 }
 
-/* ── LeCaR RL Eviction Implementation ─────────────────────── */
+/* ── Eviction 2Q (scan-based) ─────────────────────────────────
+ * L'implementazione precedente pescava un hash dalla FIFO probatoria (mai
+ * popolata da nexdash_set: nessun enqueue esisteva) e chiamava
+ * nexdash_del(t, NULL, 0), che nexdash_del rifiuta immediatamente
+ * (key==NULL) — la funzione non liberava mai una sola entry, quindi la
+ * cache si bloccava non appena piena. Questa versione scansiona
+ * direttamente la tabella (prima TIER_PROBATORY, poi TIER_PROTECTED come
+ * da semantica 2Q) e libera davvero gli slot via nd_release_slot, che
+ * a sua volta invoca free_cb sul value. Non è la coda FIFO O(1) originale,
+ * ma è corretta; il ripristino delle code prob/prot per l'ordinamento
+ * FIFO/LRU esatto è un'ottimizzazione successiva, non un prerequisito
+ * di correttezza. */
 size_t nexdash_evict_to_target(NexDashTable *t, size_t target_bytes) {
     if (!t) return 0;
+    pthread_mutex_lock(&t->lock);
     size_t evicted = 0;
 
-    /* LeCaR: Scegliamo la policy basandoci sui pesi ML */
-    /* Per ora implementiamo una selezione pesata tra LRU (Protected) e FIFO (Probatory) */
-    while (t->used_memory > target_bytes && t->item_count > 0) {
-        /* TODO: Estendere a 7 policy come da Roadmap v6.1 */
-        /* Semplificazione: Evict dalla Probatory Queue (FIFO) prima */
-        if (t->evict.prob_size > 0) {
-            uint64_t hash = t->evict.prob_queue[t->evict.prob_head];
-            t->evict.prob_head = (t->evict.prob_head + 1) % t->evict.prob_cap;
-            t->evict.prob_size--;
+    for (int pass = 0; pass < 2 && t->used_memory > target_bytes; pass++) {
+        Eviction2QTier want = (pass == 0) ? TIER_PROBATORY : TIER_PROTECTED;
+        for (uint32_t si = 0; si < t->dir_size && t->used_memory > target_bytes; si++) {
+            NexDashSegment *seg = t->directory[si];
+            for (int bi = 0; bi < NEXDASH_BUCKET_COUNT && t->used_memory > target_bytes; bi++) {
+                NexDashBucket *bkt = &seg->buckets[bi];
+                for (int s = 0; s < NEXDASH_SLOT_COUNT && t->used_memory > target_bytes; s++) {
+                    if (!((bkt->occupancy >> s) & 1)) continue;
+                    NexDashSlot *sl = &bkt->slots[s];
+                    if (TAG_GET_TIER(sl->value_ptr) != want) continue;
 
-            if (nexdash_del(t, NULL, 0)) { /* Internally used by hash matches */
-                evicted++;
+                    nd_release_slot(t, sl);
+                    bkt->occupancy &= ~(1U << s);
+                    seg->item_count--;
+                    t->item_count--;
+                    if (want == TIER_PROBATORY) t->stats.evictions_probatory++;
+                    else t->stats.evictions_protected++;
+                    evicted++;
+                }
             }
-        } else {
-            break;
         }
     }
+    pthread_mutex_unlock(&t->lock);
     return evicted;
 }
 
 void nexdash_record_access(NexDashTable *t, const char *key, uint8_t key_len) {
+    (void)key;
+    (void)key_len;
     if (!t) return;
+    pthread_mutex_lock(&t->lock);
     /* Aggiorna pesi ML basandosi sull'hit attuale (Regret-Minimization) */
     t->ml.updates++;
     /* Se la chiave era prevista come HOT (ML) e ha fatto HIT, premia i pesi */
     for (int i = 0; i < 8; i++) {
         t->ml.weights[i] += 0.001f; /* Rinforzo positivo scemo */
     }
+    pthread_mutex_unlock(&t->lock);
 }
 
 void nexdash_print_stats(NexDashTable *t) {

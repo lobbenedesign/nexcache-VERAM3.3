@@ -29,6 +29,15 @@ GCounter *gcounter_create(uint32_t self_node_id, int num_nodes) {
 
 void gcounter_increment(GCounter *g, uint64_t delta) {
     if (!g || g->self_node >= (uint32_t)g->num_nodes) return;
+    /* GINCR accetta un long long con segno dal client, castato a uint64_t
+     * a monte (t_hash.c) — senza questo controllo un delta abbastanza
+     * grande ripetuto avvolge silenziosamente il contatore (wraparound
+     * uint64_t), riportando un totale sballato invece di saturare o
+     * segnalare l'overflow. */
+    if (delta > UINT64_MAX - g->values[g->self_node]) {
+        g->values[g->self_node] = UINT64_MAX;
+        return;
+    }
     g->values[g->self_node] += delta;
 }
 
@@ -69,11 +78,19 @@ PNCounter *pncounter_create(uint32_t self_node_id, int num_nodes) {
 
 void pncounter_increment(PNCounter *p, uint64_t delta) {
     if (!p || p->self_node >= (uint32_t)p->num_nodes) return;
+    if (delta > UINT64_MAX - p->positive[p->self_node]) {
+        p->positive[p->self_node] = UINT64_MAX;
+        return;
+    }
     p->positive[p->self_node] += delta;
 }
 
 void pncounter_decrement(PNCounter *p, uint64_t delta) {
     if (!p || p->self_node >= (uint32_t)p->num_nodes) return;
+    if (delta > UINT64_MAX - p->negative[p->self_node]) {
+        p->negative[p->self_node] = UINT64_MAX;
+        return;
+    }
     p->negative[p->self_node] += delta;
 }
 
@@ -231,6 +248,59 @@ void orset_merge(ORSet *dst, const ORSet *src) {
     pthread_rwlock_unlock(&dst->lock);
 }
 
+size_t orset_serialized_size(const ORSet *s) {
+    if (!s) return 0;
+    return sizeof(uint32_t) * 2 + (size_t)s->count * sizeof(ORSetEntry);
+}
+
+size_t orset_serialize(ORSet *s, uint8_t *buf, size_t buf_cap) {
+    if (!s || !buf) return 0;
+    pthread_rwlock_rdlock(&s->lock);
+    size_t needed = sizeof(uint32_t) * 2 + (size_t)s->count * sizeof(ORSetEntry);
+    if (buf_cap < needed) {
+        pthread_rwlock_unlock(&s->lock);
+        return 0;
+    }
+    uint8_t *p = buf;
+    memcpy(p, &s->count, sizeof(uint32_t));
+    p += sizeof(uint32_t);
+    uint32_t next_tag32 = (uint32_t)s->next_tag; /* next_tag è uint64_t ma il tag reale entra in 32 bit per questo formato */
+    memcpy(p, &next_tag32, sizeof(uint32_t));
+    p += sizeof(uint32_t);
+    if (s->count > 0) memcpy(p, s->entries, (size_t)s->count * sizeof(ORSetEntry));
+    pthread_rwlock_unlock(&s->lock);
+    return needed;
+}
+
+ORSet *orset_deserialize(const uint8_t *buf, size_t len, uint32_t self_node_id) {
+    if (!buf || len < sizeof(uint32_t) * 2) return orset_create(self_node_id);
+
+    uint32_t count, next_tag32;
+    memcpy(&count, buf, sizeof(uint32_t));
+    memcpy(&next_tag32, buf + sizeof(uint32_t), sizeof(uint32_t));
+
+    if (len < sizeof(uint32_t) * 2 + (size_t)count * sizeof(ORSetEntry)) {
+        /* Buffer troppo corto per il count dichiarato: dato corrotto,
+         * meglio ripartire da un set vuoto che leggere oltre i limiti. */
+        return orset_create(self_node_id);
+    }
+
+    ORSet *s = (ORSet *)calloc(1, sizeof(ORSet));
+    if (!s) return NULL;
+    s->self_node = self_node_id;
+    s->capacity = count > 0 ? count : 1;
+    s->entries = (ORSetEntry *)calloc(s->capacity, sizeof(ORSetEntry));
+    if (!s->entries) {
+        free(s);
+        return NULL;
+    }
+    if (count > 0) memcpy(s->entries, buf + sizeof(uint32_t) * 2, (size_t)count * sizeof(ORSetEntry));
+    s->count = count;
+    s->next_tag = next_tag32;
+    pthread_rwlock_init(&s->lock, NULL);
+    return s;
+}
+
 void orset_destroy(ORSet *s) {
     if (!s) return;
     pthread_rwlock_destroy(&s->lock);
@@ -286,7 +356,14 @@ void lww_merge(LWWRegister *dst, const LWWRegister *src) {
         should_update = 1;
     }
 
-    if (should_update) {
+    if (should_update && src->value_len <= sizeof(dst->value)) {
+        /* PRIMA: lww_set valida value_len<=1023 contro il buffer fisso
+         * value[1024], ma lww_merge copiava src->value_len senza alcun
+         * controllo. Se src arriva da una deserializzazione di rete (l'uso
+         * previsto per un CRDT multi-master, anche se oggi non ancora
+         * collegato a un canale di replica reale), un value_len
+         * corrotto/malevolo oltre 1024 causa overflow del buffer fisso
+         * dst->value. */
         memcpy(dst->value, src->value, src->value_len);
         dst->value_len = src->value_len;
         dst->timestamp_us = src->timestamp_us;

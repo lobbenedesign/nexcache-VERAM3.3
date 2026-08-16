@@ -68,6 +68,10 @@ start_server {tags {"maxmemory external:skip"}} {
             # keys / client eviction, or we time out.
             set t [clock seconds]
             while {![check_eviction_test $client_eviction] && [expr [clock seconds] - $t] < 20} {
+                puts "DEBUG_TS: dbsize=[r dbsize] evicted_keys=[s evicted_keys] evicted_clients=[s evicted_clients]"
+                if {$client_eviction == "false" && $::verbose} {
+                    puts "T=[expr [clock seconds] - $t] used_memory: [format "%.2f MB" [expr [s used_memory] / 1048576.0]], mem_limit: [format "%.2f MB" [expr [r config get maxmemory] / 1048576.0]], dbsize: [r dbsize], evicted_keys: [s evicted_keys]"
+                }
                 foreach rr $clients {
                     if {[catch {
                         $rr mget 1

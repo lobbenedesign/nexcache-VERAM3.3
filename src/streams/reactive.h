@@ -142,15 +142,26 @@ int stream_bp_add(const char *stream_name,
                   size_t out_id_cap);
 
 /**
- * stream_bp_read - XREAD con backpressure e auto-credit.
- * Legge messaggi E aggiorna automaticamente il credito del producer.
+ * stream_bp_read - Contabilità di credito per una XREAD con backpressure.
+ *
+ * IMPORTANTE (limite architetturale, non un bug isolato): questo modulo
+ * NON possiede i dati dei messaggi — tiene solo un contatore di
+ * "pending" per stream. @out_msgs NON viene mai popolato (era così anche
+ * prima: il parametro era scartato con `(void)out_msgs`). Il vero
+ * recupero dei messaggi deve avvenire chiamando XREADGROUP dello stream
+ * engine reale (t_stream.c) SEPARATAMENTE; questa funzione va usata solo
+ * per calcolare quanti messaggi il credito corrente permette di
+ * consegnare e per aggiornare le statistiche — non come sostituto della
+ * lettura vera. Integrarla operativamente con XREADGROUP è un lavoro di
+ * wiring separato, non ancora fatto (nessun comando XREAD_BP esiste nel
+ * command table).
  *
  * @stream_name:    Stream sorgente
  * @consumer_group: Consumer group
  * @consumer_name:  Nome del consumer specifico
- * @count:          Messaggi da leggere
- * @out_msgs:       Output messaggi
- * @out_count:      Numero messaggi letti
+ * @count:          Messaggi richiesti
+ * @out_msgs:       Non popolato (vedi sopra) — riservato per una futura integrazione con t_stream.c
+ * @out_count:      Numero di messaggi che il credito disponibile permette di consegnare
  *
  * Returns: 0 su successo, -1 su errore.
  */
@@ -162,14 +173,23 @@ int stream_bp_read(const char *stream_name,
                    uint32_t *out_count);
 
 /**
- * stream_bp_ack - Conferma messaggi processati e rilascia credit.
+ * stream_bp_ack - Rilascia credit per @nids messaggi.
+ *
+ * IMPORTANTE: @ids non viene validato contro messaggi realmente pending
+ * (questo modulo non tiene traccia degli ID, solo di un contatore
+ * aggregato — vedi nota su stream_bp_read). Il rilascio di credito è
+ * basato solo su @nids: un chiamante che passa un nids non corrispondente
+ * ai messaggi davvero confermati dal consumer desincronizza il conteggio
+ * di credito dal reale stato del consumer group. La validazione per-ID
+ * richiederebbe integrare questo modulo con lo stream engine reale
+ * (t_stream.c), non ancora fatto.
  *
  * @stream_name:    Stream
  * @consumer_group: Consumer group
- * @ids:            Array di ID da confermare
- * @nids:           Numero di ID
+ * @ids:            Non validato — vedi sopra
+ * @nids:           Numero di messaggi per cui rilasciare credito (deve essere >= 0)
  *
- * Returns: numero di messaggi confermati.
+ * Returns: numero di messaggi confermati (credito rilasciato), -1 su errore.
  */
 int stream_bp_ack(const char *stream_name,
                   const char *consumer_group,

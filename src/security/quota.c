@@ -52,6 +52,23 @@ void quota_shutdown(void) {
     pthread_mutex_unlock(&g_lock);
 }
 
+/* Confronto token a tempo costante: strcmp() esce al primo byte diverso,
+ * lasciando che un attaccante di rete recuperi un token valido byte per
+ * byte misurando i tempi di risposta di AUTH. pqcrypto.c usa già un
+ * confronto costante per i propri token — qui non era stato applicato
+ * nonostante sia esattamente lo stesso path (autenticazione client). */
+static int ct_str_equal(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    volatile uint8_t diff = (uint8_t)(la != lb);
+    size_t n = la < lb ? la : lb;
+    for (size_t i = 0; i < n; i++) diff |= (uint8_t)(a[i] ^ b[i]);
+    /* Se le lunghezze differiscono continuiamo comunque a leggere fino a
+     * n byte da entrambe le stringhe (già fatto sopra): non ritorniamo
+     * anticipatamente sulla mismatch di lunghezza per non reintrodurre
+     * un side-channel sulla lunghezza del token memorizzato. */
+    return diff == 0;
+}
+
 /* ── Trova namespace per nome ───────────────────────────────── */
 static Namespace *ns_find_nolock(const char *name) {
     for (int i = 0; i < g_ns_count; i++) {
@@ -132,6 +149,17 @@ int quota_namespace_update(const char *name, const char *key, const char *value)
 }
 
 /* ── quota_namespace_drop ───────────────────────────────────── */
+/* PRIMA: mutava ns->tokens/token_count/token_cap tenendo solo g_lock,
+ * mentre ogni altra funzione su questi campi (quota_auth_token_add,
+ * quota_resolve_namespace, ...) usa ns->lock. quota_auth_token_add fa
+ * lookup sotto g_lock, rilascia g_lock, POI acquisisce ns->lock — nella
+ * finestra tra le due, un quota_namespace_drop concorrente su questa
+ * stessa ns può liberare ns->tokens, impostarlo a NULL, e (bug aggiuntivo)
+ * NON resettava token_cap: quota_auth_token_add allora vede
+ * token_count(0) >= token_cap(stale, es. 8) falso, salta la realloc ed
+ * esegue ns->tokens[0] = ... su un puntatore NULL → crash.
+ * ORA: la mutazione dei token avviene sotto ns->lock come ovunque altrove,
+ * e token_cap viene azzerato insieme a tokens. */
 int quota_namespace_drop(const char *name) {
     pthread_mutex_lock(&g_lock);
     Namespace *ns = ns_find_nolock(name);
@@ -139,15 +167,18 @@ int quota_namespace_drop(const char *name) {
         pthread_mutex_unlock(&g_lock);
         return -1;
     }
+    ns->active = 0; /* sotto g_lock: impedisce nuovi lookup da ns_find_nolock */
+    pthread_mutex_unlock(&g_lock);
 
+    pthread_mutex_lock(&ns->lock);
     for (int i = 0; i < ns->token_count; i++) free(ns->tokens[i]);
     free(ns->tokens);
     ns->tokens = NULL;
     ns->token_count = 0;
-    ns->active = 0;
+    ns->token_cap = 0;
     memset(&ns->config, 0, sizeof(NamespaceConfig));
+    pthread_mutex_unlock(&ns->lock);
 
-    pthread_mutex_unlock(&g_lock);
     fprintf(stderr, "[NexCache Quota] Namespace '%s' dropped\n", name);
     return 0;
 }
@@ -201,7 +232,7 @@ int quota_resolve_namespace(const char *token, char *out_name, size_t out_cap) {
         Namespace *ns = &g_namespaces[i];
         if (!ns->active) continue;
         for (int j = 0; j < ns->token_count; j++) {
-            if (strcmp(ns->tokens[j], token) == 0) {
+            if (ct_str_equal(ns->tokens[j], token)) {
                 strncpy(out_name, ns->config.name, out_cap - 1);
                 out_name[out_cap - 1] = '\0';
                 pthread_mutex_unlock(&g_lock);

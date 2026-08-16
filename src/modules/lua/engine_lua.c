@@ -148,9 +148,7 @@ static uint32_t parse_semver(const char *version) {
 static void get_version_info(NexCacheModuleCtx *ctx,
                              char **nexcache_version,
                              uint32_t *nexcache_version_num,
-                             char **server_name,
-                             char **nexcache_version,
-                             uint32_t *nexcache_version_num) {
+                             char **server_name) {
     NexCacheModuleServerInfoData *info = NexCacheModule_GetServerInfo(ctx, "server");
     NexCacheModule_Assert(info != NULL);
 
@@ -160,10 +158,6 @@ static void get_version_info(NexCacheModuleCtx *ctx,
 
     const char *sn = NexCacheModule_ServerInfoGetFieldC(info, "server_name");
     *server_name = lm_strcpy(sn);
-
-    const char *vv = NexCacheModule_ServerInfoGetFieldC(info, "nexcache_version");
-    *nexcache_version = lm_strcpy(vv);
-    *nexcache_version_num = parse_semver(*nexcache_version);
 
     NexCacheModule_FreeServerInfo(ctx, info);
 }
@@ -197,9 +191,7 @@ static struct luaEngineCtx *createEngineContext(NexCacheModuleCtx *ctx) {
     get_version_info(ctx,
                      &lua_engine_ctx->nexcache_version,
                      &lua_engine_ctx->nexcache_version_num,
-                     &lua_engine_ctx->server_name,
-                     &lua_engine_ctx->nexcache_version,
-                     &lua_engine_ctx->nexcache_version_num);
+                     &lua_engine_ctx->server_name);
 
     lua_engine_ctx->lua_enable_insecure_api = 0;
 

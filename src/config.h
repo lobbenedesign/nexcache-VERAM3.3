@@ -420,7 +420,11 @@ void setcpuaffinity(const char *cpulist);
 #define HAVE_IFUNC 0
 #endif
 
-/* G3-GODMODE: NVIDIA Vera (Rubin) Architecture Constants */
-#define NEX_RCU_SHARDS 16
+/* G3-GODMODE: NVIDIA Vera (Rubin) Architecture Constants.
+ * NEX: 176 is the historical "record" value — all pre-2026-07 binaries shipped
+ * with segcache.o compiled at 176 (stale subdir objects survived `make clean`,
+ * which only removes top-level *.o). 16 measurably regresses concurrent GETs
+ * (lock contention across IO threads: 240K vs 621K ops/s on M1). */
+#define NEX_RCU_SHARDS 176
 
 #endif

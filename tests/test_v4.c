@@ -64,7 +64,7 @@ static void test_nexdash(void) {
 
   T_START("NexDash: set + get string");
   {
-    nexdash_set(t, "hello", 5, (void *)"world", NTYPE_STRING, 0);
+    nexdash_set(t, "hello", 5, (void *)"world", 6, NTYPE_STRING, 0);
     NexEntryType tp;
     void *v = nexdash_get(t, "hello", 5, &tp);
     if (!v || strcmp((char *)v, "world") != 0 || tp != NTYPE_STRING) {
@@ -80,7 +80,7 @@ static void test_nexdash(void) {
     for (int i = 0; i < 1000; i++) {
       snprintf(kb, sizeof(kb), "key:%05d", i);
       snprintf(vb, sizeof(vb), "val:%05d", i);
-      nexdash_set(t, kb, (uint8_t)strlen(kb), strdup(vb), NTYPE_STRING, 0);
+      nexdash_set(t, kb, (uint8_t)strlen(kb), strdup(vb), (uint32_t)(strlen(vb) + 1), NTYPE_STRING, 0);
     }
     for (int i = 0; i < 1000 && ok; i++) {
       snprintf(kb, sizeof(kb), "key:%05d", i);
@@ -98,7 +98,7 @@ static void test_nexdash(void) {
 
   T_START("NexDash: delete key");
   {
-    nexdash_set(t, "todel", 5, (void *)"data", NTYPE_STRING, 0);
+    nexdash_set(t, "todel", 5, (void *)"data", 5, NTYPE_STRING, 0);
     int d = nexdash_del(t, "todel", 5);
     NexEntryType tp;
     void *r = nexdash_get(t, "todel", 5, &tp);
@@ -110,7 +110,7 @@ static void test_nexdash(void) {
 
   T_START("NexDash: exists");
   {
-    nexdash_set(t, "ex1", 3, (void *)"v", NTYPE_STRING, 0);
+    nexdash_set(t, "ex1", 3, (void *)"v", 2, NTYPE_STRING, 0);
     int e1 = nexdash_exists(t, "ex1", 3);
     int e2 = nexdash_exists(t, "noex", 4);
     if (e1 != 1 || e2 != 0)
@@ -122,7 +122,7 @@ static void test_nexdash(void) {
   T_START("NexDash: expire encoding round-trip");
   {
     uint64_t exp = (uint64_t)time(NULL) * 1000000ULL + 3600000000ULL;
-    nexdash_set(t, "ttlkey", 6, (void *)"val", NTYPE_STRING, exp);
+    nexdash_set(t, "ttlkey", 6, (void *)"val", 4, NTYPE_STRING, exp);
     NexEntryType tp;
     void *out = nexdash_get(t, "ttlkey", 6, &tp);
     if (!out)

@@ -243,10 +243,22 @@ nexstorage_set(NexStorage *ns, const char *key, uint32_t key_len, const uint8_t 
 static inline NexStorageResult
 nexstorage_del(NexStorage *ns, const char *key, uint32_t key_len) {
     if (!ns || !ns->main_api || !ns->object_api) return NEXS_ERROR;
-    /* Elimina da entrambi per sicurezza se non sappiamo il tipo */
+    /* NEX-PERF: prima cancellava SEMPRE da entrambi gli store, anche
+     * quando il chiamante non conosce il tipo — "per sicurezza". Ma una
+     * chiave è o una stringa (main_api/segcache) o un tipo complesso
+     * (object_api/nexdash), mai entrambe contemporaneamente: se il primo
+     * delete trova ed elimina la chiave, il secondo store non può
+     * contenerla e la seconda chiamata è lavoro sprecato al 100%.
+     * Misurato con `sample` sotto carico SET puro: nexdash_del appariva
+     * come hotspot reale (292 campioni) nonostante SET scriva SOLO
+     * stringhe — ogni SET pagava un hash + una ricerca NEON nel bucket
+     * di NexDashTable che falliva SEMPRE. Ora: prova prima il main_api
+     * (store più caldo, dove vive la stragrande maggioranza delle chiavi
+     * in un workload tipico); se trova ed elimina, salta l'object_api. */
     NexStorageResult r1 = ns->main_api->del(ns->main_backend, key, key_len);
+    if (r1 == NEXS_OK) return NEXS_OK;
     NexStorageResult r2 = ns->object_api->del(ns->object_backend, key, key_len);
-    return (r1 == NEXS_OK || r2 == NEXS_OK) ? NEXS_OK : NEXS_NOT_FOUND;
+    return r2 == NEXS_OK ? NEXS_OK : NEXS_NOT_FOUND;
 }
 
 static inline NexStorageResult

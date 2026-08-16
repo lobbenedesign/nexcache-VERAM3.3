@@ -5,6 +5,9 @@
  */
 
 #include "io_threads.h"
+#include "core/nexstorage.h"
+
+extern NexStorage *global_nexstorage;
 
 static _Thread_local int thread_id = 0; /* Thread local var */
 static pthread_t io_threads[IO_THREADS_MAX_NUM] = {0};
@@ -411,6 +414,28 @@ int trySendReadToIOThreads(client *c) {
     c->read_flags = canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE;
     c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
     c->read_flags |= isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
+
+    /* NEX-FASTPATH: grant the IO thread permission to execute eligible simple
+     * GETs directly against NexStorage. All server/client-state checks happen
+     * here on the main thread so the IO thread only needs per-command checks.
+     * Conservative: default user only, db 0 only, no MULTI/tracking/pubsub,
+     * and the client reply buffer must be idle (nobody else may touch it). */
+    if (server.nex_io_fastpath && global_nexstorage != NULL &&
+        !server.cluster_enabled && c->db && c->db->id == 0 &&
+        c->user == DefaultUser &&
+        !c->flag.multi && !c->flag.tracking &&
+        c->pubsub_data == NULL &&
+        /* Appending to c->buf from the IO thread is safe even with a write in
+         * flight: read/write jobs are pinned to the same IO thread (FIFO), the
+         * main thread never folds a completed write while our read is PENDING,
+         * and post-write compaction relocates bytes appended past
+         * io_last_bufpos. The only hard constraint is an empty reply LIST —
+         * list blocks are flushed after c->buf, so appending to the buffer
+         * would reorder replies. Encoded buffers use header bookkeeping our
+         * raw append would corrupt. */
+        listLength(c->reply) == 0 && !c->flag.buf_encoded &&
+        !(c->read_flags & (READ_FLAGS_DONT_PARSE | READ_FLAGS_AUTH_REQUIRED | READ_FLAGS_REPLICATED)))
+        c->read_flags |= READ_FLAGS_FASTPATH_OK;
 
     c->io_read_state = CLIENT_PENDING_IO;
     connSetPostponeUpdateState(c->conn, 1);

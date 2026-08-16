@@ -50,7 +50,15 @@ typedef enum DataType {
     DATATYPE_EMBEDDING = 5, /* Vettori float — poco comprimibili */
 } DataType;
 
-/* ── Header di un dato compresso (16 byte) ──────────────────── */
+/* ── Header di un dato compresso (19 byte) ────────────────────
+ * PRIMA: checksum era un XOR a 1 byte — ~1/256 di probabilità di
+ * accettare silenziosamente un payload corrotto in decompress_data, e
+ * trivialmente aggirabile da un flip di due byte con la stessa parità
+ * nella stessa posizione. Sufficiente come sanity check interno, non
+ * come integrity check se questo buffer attraversa un confine non
+ * fidato (replica, tiering su disco). Il campo è stato allargato a
+ * CRC32 (nessun dato reale è mai stato persistito con questo formato,
+ * dato che il modulo non è ancora collegato a un command path). */
 typedef struct __attribute__((packed)) CompressedHeader {
     uint32_t magic;           /* 0x4E584348 = "NXCH" */
     uint32_t original_size;   /* Dimesione dati originali */
@@ -58,7 +66,7 @@ typedef struct __attribute__((packed)) CompressedHeader {
     uint8_t comp_type;        /* CompressionType */
     uint8_t data_type;        /* DataType (hint) */
     uint8_t level;            /* Livello compressione */
-    uint8_t checksum;         /* XOR checksum dei byte dati */
+    uint32_t checksum;        /* CRC32 dei byte dati */
 } CompressedHeader;
 
 #define COMPRESS_MAGIC 0x4E584348U /* "NXCH" */

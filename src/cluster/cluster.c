@@ -104,6 +104,12 @@ static uint64_t fnv1a_64(const char *data, size_t len) {
     return h;
 }
 
+static int ring_entry_cmp(const void *a, const void *b) {
+    uint64_t ha = ((const RingEntry *)a)->hash;
+    uint64_t hb = ((const RingEntry *)b)->hash;
+    return (ha > hb) - (ha < hb);
+}
+
 /* ── Rebuild del consistent hash ring ──────────────────────── */
 static void rebuild_ring(ClusterIndex *ci) {
     ci->ring_size = 0;
@@ -123,16 +129,14 @@ static void rebuild_ring(ClusterIndex *ci) {
         if (ci->ring_size >= CLUSTER_RING_SIZE) break;
     }
 
-    /* Ordina il ring per hash (insertion sort — ring piccolo) */
-    for (int i = 1; i < ci->ring_size; i++) {
-        RingEntry tmp = ci->ring[i];
-        int j = i - 1;
-        while (j >= 0 && ci->ring[j].hash > tmp.hash) {
-            ci->ring[j + 1] = ci->ring[j];
-            j--;
-        }
-        ci->ring[j + 1] = tmp;
-    }
+    /* PRIMA: insertion sort O(n²), commentato come "ring piccolo" — ma
+     * CLUSTER_RING_SIZE = CLUSTER_MAX_NODES * CLUSTER_VIRTUAL_NODES può
+     * arrivare a 19200 entry, quindi fino a ~10^8 confronti nel caso
+     * peggiore, eseguiti sincronamente su ogni add/remove/mark_failed
+     * TENENDO il write-lock che blocca ogni cluster_key_to_node
+     * concorrente nel frattempo — l'opposto di "failover in <1s". qsort
+     * è O(n log n) ed è drop-in per un array di struct semplice. */
+    qsort(ci->ring, (size_t)ci->ring_size, sizeof(RingEntry), ring_entry_cmp);
 
     /* Ricalcola slot_to_node per ogni slot CRC16 */
     for (int slot = 0; slot < CLUSTER_SLOT_COUNT; slot++) {
@@ -164,6 +168,7 @@ ClusterIndex *cluster_init(uint32_t self_id, const char *host, uint16_t port) {
     ci->node_count = 0;
     ci->self_idx = -1;
     pthread_rwlock_init(&ci->rwlock, NULL);
+    pthread_mutex_init(&ci->stats_lock, NULL);
 
     /* Aggiungi sé stesso */
     ClusterNode *self = &ci->nodes[0];
@@ -175,6 +180,7 @@ ClusterIndex *cluster_init(uint32_t self_id, const char *host, uint16_t port) {
     self->slot_end = CLUSTER_SLOT_COUNT - 1;
     self->last_ping_us = cluster_us_now();
     strncpy(self->host, host ? host : "127.0.0.1", sizeof(self->host) - 1);
+    self->host[sizeof(self->host) - 1] = '\0'; /* strncpy non termina se src >= n byte */
     ci->node_count = 1;
     ci->self_idx = 0;
 
@@ -214,6 +220,7 @@ int cluster_add_node(ClusterIndex *ci, uint32_t id, const char *host, uint16_t p
     n->slot_end = slot_end;
     n->last_ping_us = cluster_us_now();
     strncpy(n->host, host, sizeof(n->host) - 1);
+    n->host[sizeof(n->host) - 1] = '\0';
 
     /* Aggiorna range slot del nodo locale se dobbiamo cedere slot */
     rebuild_ring(ci);
@@ -280,10 +287,21 @@ uint32_t cluster_key_to_node(ClusterIndex *ci,
     uint32_t node_id = (uint32_t)ci->slot_to_node[slot];
     pthread_rwlock_unlock(&ci->rwlock);
 
-    ci->stats.key_lookups++;
+    /* PRIMA: questi due campi venivano mutati DOPO aver rilasciato il
+     * rwlock, su un percorso chiamato per ogni singola operazione — due
+     * thread concorrenti perdevano incrementi (key_lookups++ non atomico)
+     * e potevano leggere/scrivere avg_lookup_us in modo non sincronizzato
+     * con cluster_get_stats (che legge sotto rdlock, non sotto questo
+     * mutex): valori torn/incoerenti su un double a 8 byte non è garantito
+     * atomico su ogni architettura. Un mutex dedicato piccolo (non il
+     * rwlock principale, per non serializzare i lookup dello slot) risolve
+     * entrambi senza reintrodurre contesa sul percorso caldo di routing. */
     uint64_t elapsed = cluster_us_now() - t0;
+    pthread_mutex_lock(&ci->stats_lock);
+    ci->stats.key_lookups++;
     ci->stats.avg_lookup_us = ci->stats.avg_lookup_us * 0.999 +
                               (double)elapsed * 0.001;
+    pthread_mutex_unlock(&ci->stats_lock);
     return node_id;
 }
 
@@ -350,7 +368,9 @@ ClusterStats cluster_get_stats(ClusterIndex *ci) {
     ClusterStats empty = {0};
     if (!ci) return empty;
     pthread_rwlock_rdlock(&ci->rwlock);
+    pthread_mutex_lock(&ci->stats_lock);
     ClusterStats s = ci->stats;
+    pthread_mutex_unlock(&ci->stats_lock);
     pthread_rwlock_unlock(&ci->rwlock);
     return s;
 }
@@ -383,5 +403,6 @@ void cluster_print_status(ClusterIndex *ci) {
 void cluster_shutdown(ClusterIndex *ci) {
     if (!ci) return;
     pthread_rwlock_destroy(&ci->rwlock);
+    pthread_mutex_destroy(&ci->stats_lock);
     free(ci);
 }

@@ -68,6 +68,13 @@ typedef struct VLLManager {
     uint32_t *read_counts; /* Contatore lettori per slot */
     uint8_t *write_flags;  /* 1 = slot ha uno scrittore */
     uint32_t table_size;   /* Power of 2 */
+    /* Protegge read_counts/write_flags: senza di esso, due transazioni
+     * concorrenti possono entrambe leggere write_flags[slot]==0, decidere
+     * entrambe di acquisire e scriverlo entrambe a 1 (TOCTOU) — il lock
+     * manager stesso non garantiva l'esclusione mutua che dovrebbe fornire.
+     * Tenuto solo per la durata della scansione/acquisizione di un
+     * singolo tentativo, mai durante l'usleep di backoff. */
+    pthread_mutex_t table_lock;
 
     /* Pattern history per predictive ordering */
     VLLPattern *patterns;

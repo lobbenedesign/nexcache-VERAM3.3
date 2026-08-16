@@ -1,10 +1,16 @@
 /* NexTS — TimeSeries Engine (Native BSD)
  * ============================================================
  * Ispirato a Gorilla (Facebook) e NexCacheTimeSeries.
- * Caratteristiche:
- *   - Compressione Delta-of-Delta per timestamp
- *   - Compressione XOR (floating point) per valori
- *   - Auto-tiering: chunks vecchi spostabili su SSD/Cloud
+ *
+ * Stato attuale (onesto): i campioni sono memorizzati NON compressi
+ * (struct NexSample raw, 16 byte/campione). La compressione
+ * Delta-of-Delta (timestamp) e XOR (valori double) in stile Gorilla è
+ * pianificata ma non ancora implementata — vedi commento in nexts_add()
+ * per il motivo. "Auto-tiering su SSD/Cloud" non è implementato.
+ * Retention (rimozione automatica dei chunk più vecchi del retention_ms
+ * configurato) e aggregazioni (AVG/SUM/MIN/MAX/COUNT) sono implementate.
+ * Nessun comando client (TS.ADD/TS.RANGE/...) è collegato a questo
+ * modulo — vedi Makefile.
  *
  * Copyright (c) 2026 NexCache Project — BSD License
  */
@@ -44,6 +50,7 @@ typedef struct NexTS {
 NexTS *nexts_create(int64_t retention_ms);
 void nexts_destroy(NexTS *ts);
 
+/* Returns: 0 su successo, -1 su errore. */
 int nexts_add(NexTS *ts, int64_t timestamp, double value);
 NexSample *nexts_query(NexTS *ts, int64_t start, int64_t end, uint32_t *count_out);
 

@@ -101,7 +101,19 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
         NexEntry entry;
         NexStorageResult res = nexstorage_get(global_nexstorage, objectGetVal(key), sdslen(objectGetVal(key)), &entry);
         if (res == NEXS_OK) {
-            /* NEX-VERA: Creazione oggetto con tipo consapevole (Mapping corretto) */
+            /* NEX-VERA: Creazione oggetto con tipo consapevole (Mapping corretto)
+             * NOTA (verificato 2026-08-07, audit del fast-path): per i tipi
+             * complessi (Hash/List/Set/ZSet) il ramo sotto crea uno stub VUOTO
+             * (createObject(type, NULL)) invece di deserializzare entry.value —
+             * se mai eseguito con dati reali, questo perderebbe silenziosamente
+             * il contenuto. Verificato con grep globale che NESSUN punto di
+             * questo codebase scrive mai un entry.type diverso da NEXDT_STRING
+             * in NexStorage (solo t_string.c fa write-through, sempre STRING),
+             * quindi oggi questo ramo non si attiva mai con dati reali —
+             * codice difensivo mai esercitato, non un bug attivo. Se in futuro
+             * si aggiunge write-through per tipi complessi, questo ramo va
+             * implementato per davvero prima, altrimenti diventa un data-loss
+             * bug reale. */
             int type = OBJ_STRING;
             if (entry.type == 1) type = OBJ_HASH;
             else if (entry.type == 2) type = OBJ_LIST;
@@ -792,6 +804,20 @@ long long dbTotalServerKeyCount(void) {
 /* Note that the 'c' argument may be NULL if the key was modified out of
  * a context of a client. */
 void signalModifiedKey(client *c, serverDb *db, robj *key) {
+    /* NEX-FASTPATH coherence: any modification invalidates the NexStorage
+     * copy so IO-thread fast-path GETs can never serve stale data. NEX-PERF:
+     * questo era l'UNICO meccanismo di invalidazione per DEL/EXPIRE/ecc.;
+     * SET aveva invece un write-through manuale separato e più costoso
+     * (vedi t_string.c) — ora anche SET passa da qui, quindi ogni comando
+     * di scrittura paga lo stesso costo economico (solo invalidazione, mai
+     * copia del valore). Il repopolamento della cache fast-path avviene in
+     * modo lazy dal lato lettura (getGenericCommand in t_string.c). */
+    if (server.nex_io_fastpath && global_nexstorage) {
+        robj *dkey = key;
+        if (key->encoding == OBJ_ENCODING_INT) dkey = getDecodedObject(key);
+        nexstorage_del(global_nexstorage, objectGetVal(dkey), (uint32_t)sdslen(objectGetVal(dkey)));
+        if (dkey != key) decrRefCount(dkey);
+    }
     touchWatchedKey(db, key);
     trackingInvalidateKey(c, key, 1);
 }

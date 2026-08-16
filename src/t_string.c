@@ -37,6 +37,8 @@
 #include "core/nexstorage.h"
 #include "kvstore.h"
 
+extern NexStorage *global_nexstorage;
+
 /* Forward declarations */
 int getGenericCommand(client *c);
 
@@ -140,6 +142,28 @@ void setGenericCommand(client *c,
     setkey_flags |= ((flags & ARGS_KEEPTTL) || expire) ? SETKEY_KEEPTTL : 0;
     setkey_flags |= found ? SETKEY_ALREADY_EXIST : SETKEY_DOESNT_EXIST;
 
+    /* NEX-PERF: la vecchia versione sopprimeva l'invalidazione di
+     * signalModifiedKey() (nex_inval_suppress) per poi fare un write-through
+     * completo su NexStorage subito dopo — cioè PAGAVA il costo di una
+     * seconda scrittura completa (hash + copia key+value in un nuovo
+     * segmento) ad OGNI singolo SET, solo per tenere calda la cache del
+     * fast-path in lettura. Misurato: SET puro 68k ops/sec su VERAM3.3
+     * contro i 99k ops/sec di SOVEREIGN (che non ha affatto il fast-path,
+     * quindi fa un solo write) — VERAM3.3 pagava il prezzo pieno del
+     * doppio-store su OGNI scrittura per un beneficio che tocca solo le
+     * chiavi effettivamente rilette via fast-path.
+     *
+     * Ora invece: nessuna soppressione, nessun write-through manuale.
+     * setKey()/setExpire() chiamano normalmente signalModifiedKey(), che
+     * fa già un nexstorage_del() economico (nessuna copia del valore, solo
+     * invalidazione) — lo stesso meccanismo già usato per DEL/EXPIRE/ogni
+     * altro comando di scrittura. Il "riscaldamento" della cache fast-path
+     * passa invece dal lato lettura: getGenericCommand() (vedi sotto)
+     * ripopola NexStorage in modo lazy al primo GET dopo un miss/scrittura
+     * — classico pattern read-through invece di write-through. Risultato:
+     * SET torna al costo di UNA sola scrittura (come SOVEREIGN); il primo
+     * GET su una chiave appena scritta prende lo slow path una volta sola,
+     * i successivi tornano a colpire il fast-path negli IO-thread. */
     setKey(c, c->db, key, &val, setkey_flags);
     if (expire) val = setExpire(c, c->db, key, milliseconds);
 
@@ -292,6 +316,42 @@ int getGenericCommand(client *c) {
     }
 
     addReplyBulk(c, o);
+
+    /* NEX-PERF: read-through repopulation — vedi il commento in
+     * setGenericCommand per il perché SET non fa più write-through. Questa
+     * funzione gira solo sullo slow path (il fast-path negli IO-thread
+     * intercetta i GET prima che arrivino qui), quindi il costo di questo
+     * repopolamento è isolato ai soli miss del fast-path — tipicamente il
+     * primo GET dopo un SET/overwrite — non ad ogni lettura.
+     *
+     * NEX-FIX: il controllo originale limitava il ripopolamento ai soli
+     * valori con encoding RAW/EMBSTR, escludendo OBJ_ENCODING_INT — cioè
+     * ESATTAMENTE i valori interi (contatori, ID numerici, il caso più
+     * comune di INCR o di un semplice SET con un numero). Quelle chiavi
+     * non venivano MAI ripopolate in NexStorage: ogni loro GET, anche
+     * ripetuto all'infinito sulla stessa chiave calda, restava per sempre
+     * sullo slow path — un buco di copertura sistematico, non solo il
+     * primo-tocco atteso. Fix: decodifica sempre il valore con
+     * getDecodedObject() (già usato per la chiave qui sotto), come faceva
+     * il vecchio write-through di SET prima del redesign — costo minimo
+     * (per RAW/EMBSTR è solo un incrRefCount, per INT una ll2string su un
+     * buffer di poche decine di byte). */
+    if (server.nex_io_fastpath && global_nexstorage && c->db->id == 0) {
+        robj *dkey = getDecodedObject(c->argv[1]);
+        robj *dval = getDecodedObject(o);
+        int64_t rel_ttl = -1;
+        long long when = getExpire(c->db, c->argv[1]);
+        if (when >= 0) {
+            rel_ttl = when - commandTimeSnapshot();
+            if (rel_ttl <= 0) rel_ttl = 1;
+        }
+        nexstorage_set(global_nexstorage, objectGetVal(dkey), (uint32_t)sdslen(objectGetVal(dkey)),
+                       (const uint8_t *)objectGetVal(dval), (uint32_t)sdslen(objectGetVal(dval)),
+                       NEXDT_STRING, rel_ttl);
+        if (dval != o) decrRefCount(dval);
+        if (dkey != c->argv[1]) decrRefCount(dkey);
+    }
+
     return C_OK;
 }
 

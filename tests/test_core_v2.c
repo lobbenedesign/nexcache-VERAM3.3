@@ -94,12 +94,23 @@ static void test_tagged_ptr(void) {
   else
     test_fail("flag TPTR_FLAG_COMPRESSED", "not set");
 
-  /* Test 7: version bump */
+  /* Test 7: version bump.
+   * tptr_version/tptr_set_version degradano deliberatamente a no-op
+   * quando g_nexarch.metadata_bits < 16 (non ci sono abbastanza bit
+   * liberi nel puntatore per un campo versione separato — su questo
+   * arch, es. ARM64 via TBI, sono disponibili solo 8 bit totali per
+   * type+subtype+flags). Il test deve verificare il comportamento
+   * corretto per l'architettura corrente, non assumere 16+ bit ovunque. */
   TaggedPtr tp5 = tptr_create(&data, NEXTYPE_STRING, 0, 0, 0);
   TaggedPtr tp5v = tptr_bump_version(tp5);
-  if (tptr_version(tp5v) == 1)
+  if (g_nexarch.metadata_bits < 16) {
+    if (tptr_version(tp5v) == 0)
+      test_pass("tptr_bump_version: no-op su metadata_bits<16 (atteso)");
+    else
+      test_fail("tptr_bump_version", "doveva restare 0 su metadata_bits<16");
+  } else if (tptr_version(tp5v) == 1) {
     test_pass("tptr_bump_version v0→v1");
-  else {
+  } else {
     char msg[64];
     snprintf(msg, sizeof(msg), "version=%d", tptr_version(tp5v));
     test_fail("tptr_bump_version", msg);
@@ -121,13 +132,27 @@ static void test_tagged_ptr(void) {
   else
     test_fail("TPTR_MARK_DIRTY", "flag not set");
 
-  /* Test 10: TPTR_MARK_COLD macro */
+  /* Test 10: TPTR_MARK_COLD macro.
+   * FIX 2026-08-07: il layout flags ora si adatta a g_nexarch.metadata_bits
+   * (vedi tagged_ptr.h) — con >=10 bit disponibili (il caso comune su
+   * x86-64 senza LA57, 16 bit) TPTR_FLAG_COLD è pienamente rappresentabile.
+   * Su architetture con budget più stretto (ARM64 TBI=8 bit, come questa
+   * macchina) il flag degrada a no-op silenzioso, quindi il test verifica
+   * il comportamento corretto per l'architettura corrente invece di
+   * assumere sempre il caso "wide". */
   TaggedPtr tp7 = TPTR_SIMPLE(&data, NEXTYPE_TIMESERIES);
   tp7 = TPTR_MARK_COLD(tp7);
-  if (tptr_is_cold(tp7))
-    test_pass("TPTR_MARK_COLD → tptr_is_cold");
-  else
-    test_fail("TPTR_MARK_COLD", "flag not set");
+  if (NEXPTR_FLAGS_WIDE) {
+    if (tptr_is_cold(tp7))
+      test_pass("TPTR_MARK_COLD → tptr_is_cold (wide flags)");
+    else
+      test_fail("TPTR_MARK_COLD", "flag not set nonostante metadata_bits>=10");
+  } else {
+    if (!tptr_is_cold(tp7))
+      test_pass("TPTR_MARK_COLD: no-op su metadata_bits<10 (atteso)");
+    else
+      test_fail("TPTR_MARK_COLD", "doveva restare non impostato su metadata_bits<10");
+  }
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -386,6 +411,23 @@ int main(void) {
               "╚══════════════════════════════════════════════╝\n" RESET);
 
   uint64_t t0 = us_now();
+
+  /* memory/tagged_ptr.h documenta esplicitamente: "deve essere chiamata
+   * PRIMA di qualsiasi [uso]" — senza questa chiamata g_nexarch resta
+   * a zero (addr_mask=0, metadata_shift=0), e tptr_ptr() azzera sempre
+   * il puntatore. BUG SCOPERTO oggi rimettendo in funzione questa suite:
+   * nexarch_probe() non viene chiamata da NESSUNA parte in tutto il
+   * codebase (verificato con grep globale), nemmeno da questo stesso
+   * test file nella sua versione precedente — il modulo tagged_ptr.h
+   * "v6" è incluso da core/engine.h ma non è mai usato da nessun
+   * chiamante reale (nexdash.h ha un proprio TaggedPtr separato e
+   * incompatibile), quindi il bug non ha mai avuto un impatto in
+   * produzione finora, ma se questo modulo viene mai attivato per
+   * davvero senza questa chiamata di init, ogni tagged pointer creato
+   * sarebbe silenziosamente corrotto. */
+  if (nexarch_probe() != 0) {
+    fprintf(stderr, "WARNING: nexarch_probe() reports unsupported architecture\n");
+  }
 
   test_tagged_ptr();
   test_protocol_detect();

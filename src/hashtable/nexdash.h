@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <sys/types.h>
+#include <pthread.h>
 #include "../bloom/nexbloom.h"
 #include "../memory/arena.h"
 
@@ -85,13 +86,17 @@ typedef enum Eviction2QTier {
     TIER_PINNED = 3,    /* Mai evict (es. config, auth tokens) */
 } Eviction2QTier;
 
-/* ── NexDashSlot: 24 byte esatti (v5 compliance) ──────────── */
+/* ── NexDashSlot: 28 byte (v5.1: +value_size per memory accounting) ──
+ * v5 dichiarava 24 byte esatti; value_size è stato aggiunto per rendere
+ * used_memory/eviction accurati invece che sempre a 0 (vedi
+ * nexdash_evict_to_target) — correttezza prima dell'overhead minimo. */
 typedef struct __attribute__((packed)) NexDashSlot {
     uint64_t key_hash;    /* 8 byte: Hash completo */
     TaggedPtr value_ptr;  /* 8 byte: Puntatore + Metadati (v5 tagged) */
     uint32_t key_offset;  /* 4 byte: Offset in arena */
     uint32_t expire_us32; /* 4 byte: Expiry precision ~1s */
-} NexDashSlot;            /* Total: 24 byte */
+    uint32_t value_size;  /* 4 byte: dimensione value per accounting memoria */
+} NexDashSlot;            /* Total: 28 byte */
 
 /* ── NexDashBucket: 4 slot + probing bitmap ────────────────── */
 typedef struct NexDashBucket {
@@ -154,6 +159,13 @@ typedef struct NexDashStats {
     double hit_rate;
 } NexDashStats;
 
+/* Callback invocata per liberare un value quando lo slot che lo contiene
+ * viene sovrascritto, cancellato, evitto o scaduto. NexDashTable è
+ * agnostico sul tipo di value (puntatore opaco), quindi non può fare
+ * free() da solo: senza questa callback ogni SET-overwrite/DEL/eviction
+ * perde permanentemente la memoria del vecchio valore. */
+typedef void (*NexDashFreeCb)(void *value);
+
 /* ── NexDashTable (struttura principale) ─────────────────────── */
 typedef struct NexDashTable {
     NexDashSegment **directory; /* Array di puntatori a segmenti */
@@ -187,6 +199,18 @@ typedef struct NexDashTable {
     NexBloom *bloom; /* Filter interno per miss rate zero-latency */
 
     NexDashStats stats;
+
+    /* Sincronizzazione: la tabella è condivisa da tutti i worker thread
+     * (vedi core/engine.c, global_nexstorage). Un mutex per-tabella
+     * protegge occupancy/slot/key_pool/directory da race condition e
+     * use-after-free durante resize concorrenti. Non è lock-free (i
+     * lettori serializzano sugli scrittori), ma è corretto; sharding
+     * fine-grained/hazard-pointer è un'ottimizzazione futura, non
+     * prerequisito di correttezza. */
+    pthread_mutex_t lock;
+
+    /* Callback per liberare il value opaco su overwrite/del/evict/expire. */
+    NexDashFreeCb free_cb;
 } NexDashTable;
 
 /* ── Callback per iterazione ────────────────────────────────── */
@@ -197,8 +221,16 @@ typedef void (*NexDashIterCb)(const char *key, uint8_t key_len, void *value, uin
 NexDashTable *nexdash_create(size_t initial_segments, size_t max_memory);
 void nexdash_destroy(NexDashTable *t);
 
+/* Registra la callback usata per liberare il value opaco quando uno slot
+ * viene sovrascritto, cancellato, evitto o scade. Senza di essa, ogni SET
+ * su chiave esistente e ogni DEL/eviction/expire perdono memoria. */
+void nexdash_set_free_cb(NexDashTable *t, NexDashFreeCb cb);
+
 /* CRUD */
-int nexdash_set(NexDashTable *t, const char *key, uint8_t key_len, void *value, NexEntryType type, uint64_t expire_us);
+/* value_size: dimensione in byte del value opaco, usata per l'accounting
+ * di used_memory (necessario perché nexdash non conosce il layout interno
+ * del value). Passare 0 se l'accounting preciso non serve al chiamante. */
+int nexdash_set(NexDashTable *t, const char *key, uint8_t key_len, void *value, uint32_t value_size, NexEntryType type, uint64_t expire_us);
 void *nexdash_get(NexDashTable *t, const char *key, uint8_t key_len, NexEntryType *type_out);
 int nexdash_del(NexDashTable *t, const char *key, uint8_t key_len);
 int nexdash_exists(NexDashTable *t, const char *key, uint8_t key_len);
@@ -222,5 +254,22 @@ void nexdash_ml_train(NexDashTable *t, const char *key, uint8_t key_len, int was
 /* Stats */
 NexDashStats nexdash_get_stats(NexDashTable *t);
 void nexdash_print_stats(NexDashTable *t);
+
+/* ── Lock manuale per RMW atomico cross-call ──────────────────
+ * ndapi_rmw (core/nexstorage.c) deve eseguire get→callback→set come
+ * un'unica operazione atomica (altrimenti due INCR concorrenti sulla
+ * stessa chiave perdono un incremento: entrambi leggono lo stesso valore
+ * base). nexdash_get/nexdash_set prendono e rilasciano il lock internamente
+ * a ogni chiamata, quindi non bastano da soli. Il chiamante deve:
+ *   nexdash_lock(t);
+ *   void *v = nexdash_get_nolock(t, ...);
+ *   ... modifica ...
+ *   nexdash_set_nolock(t, ...);
+ *   nexdash_unlock(t);
+ * mantenendo il lock per l'intera sequenza. */
+void nexdash_lock(NexDashTable *t);
+void nexdash_unlock(NexDashTable *t);
+void *nexdash_get_nolock(NexDashTable *t, const char *key, uint8_t key_len, NexEntryType *type_out);
+int nexdash_set_nolock(NexDashTable *t, const char *key, uint8_t key_len, void *value, uint32_t value_size, NexEntryType type, uint64_t expire_us);
 
 #endif /* NEXCACHE_NEXDASH_H */

@@ -219,6 +219,40 @@ long long popcountNEON(void *s, long n) {
 #endif
 
 #if HAVE_ARM_SVE2
+#if defined(__linux__)
+#include <sys/auxv.h>
+#ifndef HWCAP2_SVE2
+#define HWCAP2_SVE2 (1 << 1)
+#endif
+#endif
+/* PRIMA: la scelta tra popcountSVE2 e popcountNEON dipendeva solo da
+ * HAVE_ARM_SVE2, un flag deciso a COMPILE-time (il compilatore sa
+ * generare istruzioni SVE2), senza mai verificare se la CPU che esegue
+ * il binario le supporta davvero A RUNTIME. Se il binario viene
+ * compilato su una macchina con SVE2 (es. AWS Graviton4, NVIDIA Grace)
+ * e poi eseguito su un'altra CPU ARM64 senza SVE2 (Graviton2/3, Ampere
+ * Altra, Raspberry Pi — la maggioranza del parco ARM64 in circolazione
+ * oggi), qualunque BITCOUNT/BITPOS con >=16 byte esegue istruzioni SVE2
+ * inesistenti sull'hardware → SIGILL, crash del processo server. Questo
+ * check replica lo stesso pattern già usato correttamente in questo
+ * codebase per AVX2/AVX-512 su x86 (vedi __builtin_cpu_supports più
+ * sotto e in util.c/hyperloglog.c). */
+static int arm_sve2_runtime_available(void) {
+#if defined(__linux__)
+    static int cached = -1;
+    if (cached < 0) {
+        unsigned long hwcap2 = getauxval(AT_HWCAP2);
+        cached = (hwcap2 & HWCAP2_SVE2) ? 1 : 0;
+    }
+    return cached;
+#else
+    /* Nessun modo portabile di interrogare HWCAP fuori da Linux qui:
+     * per sicurezza assumiamo SVE2 NON disponibile e usiamo il fallback
+     * NEON/scalare, piuttosto che rischiare un SIGILL. */
+    return 0;
+#endif
+}
+
 /*  G3-GODMODE: SVE2 version of popcount.
  *  Uses svcntb to count set bits in a vector-length agnostic way. */
 long long popcountSVE2(void *s, long n) {
@@ -256,10 +290,10 @@ long long serverPopcount(void *s, long count) {
 #ifdef __aarch64__
     if (count >= 16) {
 #if HAVE_ARM_SVE2
-        return popcountSVE2(s, count);
-#else
-        return popcountNEON(s, count);
+        if (arm_sve2_runtime_available())
+            return popcountSVE2(s, count);
 #endif
+        return popcountNEON(s, count);
     }
 #endif
 

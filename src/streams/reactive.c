@@ -120,14 +120,35 @@ int stream_bp_add(const char *stream_name,
             break;
 
         case BP_STRATEGY_EVICT_OLD:
-            /* In produzione: rimuovi il messaggio più vecchio dalla queue */
-            /* Stub: allow ma decrementa pending per simulare eviction */
+            /* STUB: questo modulo tiene solo un contatore di "pending",
+             * non i messaggi stessi (vedi note in reactive.h su
+             * stream_bp_read/stream_bp_ack) — non c'è nessuna coda da cui
+             * evictare davvero il messaggio più vecchio. Decrementa
+             * current_pending per liberare credito e permettere al nuovo
+             * messaggio di passare, ma NON evict nulla di reale: se mai
+             * integrato con lo stream engine vero (t_stream.c), qui va
+             * chiamato l'equivalente di XTRIM sul messaggio più vecchio. */
             if (bp->current_pending > 0) bp->current_pending--;
             break;
 
         case BP_STRATEGY_BLOCK:
         default: {
-            /* Aspetta che ci sia credito disponibile (con timeout) */
+            /* PRIMA: quando il while usciva NORMALMENTE (credito tornato
+             * disponibile — il caso comune per cui BLOCK esiste), l'ultima
+             * azione del corpo del loop era già un pthread_mutex_lock, ma
+             * subito dopo il loop il codice rilockava di nuovo
+             * incondizionatamente ("pthread_mutex_lock(&bp->lock);" prima
+             * di "bp->producer_blocks++") — doppio lock su un mutex non
+             * ricorsivo → deadlock del producer ogni volta che il
+             * backpressure si risolveva senza timeout. Sul percorso di
+             * timeout, invece, `break` usciva dal loop MENTRE il lock era
+             * rilasciato (lo unlock è la prima riga del corpo del loop),
+             * e gli incrementi di producer_blocks/producer_block_us_total
+             * avvenivano quindi senza alcun lock (race). ORA: il lock
+             * viene sempre riacquisito esplicitamente prima di uscire dal
+             * while (sia per timeout sia normalmente), quindi dopo il
+             * while bp->lock è SEMPRE tenuto esattamente una volta, e gli
+             * aggiornamenti stats avvengono sempre sotto lock. */
             uint64_t t0 = bp_us_now();
             bool timed_out = false;
 
@@ -142,21 +163,21 @@ int stream_bp_add(const char *stream_name,
                     uint64_t elapsed_ms = (bp_us_now() - t0) / 1000;
                     if (elapsed_ms >= timeout_ms) {
                         timed_out = true;
+                        pthread_mutex_lock(&bp->lock);
                         break;
                     }
                 }
                 pthread_mutex_lock(&bp->lock);
             }
 
-            if (timed_out) {
-                bp->producer_blocks++;
-                bp->producer_block_us_total += bp_us_now() - t0;
-                return -1; /* Timeout */
-            }
-
-            pthread_mutex_lock(&bp->lock);
+            /* bp->lock è tenuto qui in ogni caso. */
             bp->producer_blocks++;
             bp->producer_block_us_total += bp_us_now() - t0;
+
+            if (timed_out) {
+                pthread_mutex_unlock(&bp->lock);
+                return -1; /* Timeout */
+            }
             break;
         }
         }
@@ -215,6 +236,7 @@ int stream_bp_ack(const char *stream_name,
                   int nids) {
     (void)consumer_group;
     (void)ids;
+    if (nids < 0) return -1; /* Evita il wraparound a uint64_t sotto */
 
     pthread_mutex_lock(&g_reg_lock);
     StreamBackpressure *bp = bp_find_nolock(stream_name);

@@ -1,1 +1,0 @@
-serverassert.o: serverassert.c

@@ -207,10 +207,26 @@ void freeObjAsync(robj *key, robj *obj, int dbid) {
  * create a new empty set of hash tables and scheduling the old ones for
  * lazy freeing. */
 void emptyDbAsync(serverDb *db) {
-    int slot_count_bits = 0;
+    /* NEX-FIX: era `int slot_count_bits = 0;`, impostato a CLUSTER_SLOT_MASK_BITS
+     * solo se server.cluster_enabled — la logica originale di vanilla Redis
+     * (0 hashtable "slot" fuori cluster). Ma createDatabase() in server.c usa
+     * SEMPRE `slot_count = 176` ("G3-GODMODE: 176 shards for Vera workers"),
+     * incondizionatamente dal cluster mode. Questo path (FLUSHALL/FLUSHDB
+     * asincrono) non era mai stato allineato a quel cambiamento: il kvstore
+     * ricreato dopo un flush asincrono nasceva con num_hashtables=0.
+     *
+     * Con num_hashtables=0: kvs->rehashing resta NULL (allocato solo per
+     * num_hashtables>1), ma il guard `if (kvs->num_hashtables == 1) return;`
+     * aggiunto altrove in kvstore.c per proteggere l'accesso a quella lista
+     * NON intercetta 0 (0 != 1) — quindi kvstoreHashtableRehashingStarted()
+     * prosegue fino a listAddNodeTail(NULL, ht) al primo resize della
+     * hashtable dopo un FLUSHALL, causando un SIGSEGV deterministico.
+     * Riprodotto: FLUSHALL seguito da un burst di SET va in crash in modo
+     * affidabile con `lazyfree-lazy-user-flush yes` (default). Fix: usare
+     * lo stesso 176 di createDatabase, sempre. */
+    int slot_count_bits = 176;
     int flags = KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND;
     if (server.cluster_enabled) {
-        slot_count_bits = CLUSTER_SLOT_MASK_BITS;
         flags |= KVSTORE_FREE_EMPTY_HASHTABLES;
     }
     kvstore *oldkeys = db->keys, *oldexpires = db->expires, *oldkeyswithexpires = db->keys_with_volatile_items;

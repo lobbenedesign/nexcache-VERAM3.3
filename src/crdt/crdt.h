@@ -117,6 +117,17 @@ uint32_t orset_size(ORSet *s);
 void orset_merge(ORSet *dst, const ORSet *src);
 void orset_destroy(ORSet *s);
 
+/* Serializzazione a lunghezza variabile per la persistenza in un backend
+ * storage flat (es. NexStorage): formato [uint32_t count][uint32_t
+ * next_tag][ORSetEntry entries[count]]. Preserva add_tag/origin_node/
+ * is_removed esattamente — necessario perché orset_add() genera SEMPRE un
+ * nuovo tag con origin_node=self_node, quindi non è utilizzabile per
+ * ricostruire un ORSet già esistente senza corrompere la storia dei tag
+ * (e con essa la convergenza del merge). */
+size_t orset_serialized_size(const ORSet *s);
+size_t orset_serialize(ORSet *s, uint8_t *buf, size_t buf_cap);
+ORSet *orset_deserialize(const uint8_t *buf, size_t len, uint32_t self_node_id);
+
 /* ── API LWW-Register ─────────────────────────────────────────── */
 LWWRegister *lww_create(uint32_t self_node_id, int num_nodes);
 int lww_set(LWWRegister *r, const uint8_t *value, uint16_t len);

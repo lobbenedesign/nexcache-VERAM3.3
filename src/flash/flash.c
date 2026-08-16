@@ -287,11 +287,21 @@ void flash_record_access(FlashStorage *fs, uint64_t key_a, uint64_t key_b) {
 }
 
 /* ── flash_should_promote ───────────────────────────────────── */
+/* PRIMA: il loop iterava fino a index_count (dimensione dell'indice item,
+ * illimitata, cresce con realloc in flash_write) ma indicizzava co_graph[i]
+ * — un array a capacità FISSA (FLASH_CO_ACCESS_MAX = 1024, mai riallocato).
+ * Con index_count > 1024 (garantito su un dataset di media dimensione)
+ * questo è un heap-buffer-overrun in lettura oltre la fine di co_graph.
+ * Concettualmente era anche sbagliato: mescolava l'array degli item su
+ * disco (index) con quello del grafo di co-accesso (co_graph) — due
+ * strutture semanticamente diverse indicizzate per errore allo stesso
+ * modo. La heat di una chiave si legge dal suo FlashIndex, non dal grafo
+ * di co-accesso: basta cercare direttamente in fs->index. */
 int flash_should_promote(FlashStorage *fs, uint64_t key_hash) {
     if (!fs) return 0;
     pthread_mutex_lock(&fs->lock);
     for (uint32_t i = 0; i < fs->index_count; i++) {
-        if (fs->co_graph[i].key_hash_a == key_hash) {
+        if (fs->index[i].key_hash == key_hash) {
             int hot = fs->index[i].heat >= fs->config.heat_hot_thresh;
             pthread_mutex_unlock(&fs->lock);
             return hot;

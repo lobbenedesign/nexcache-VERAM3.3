@@ -27,34 +27,18 @@
 #define CPU_YIELD() sched_yield()
 #endif
 
-/* CRC16 per compatibilità NexCache Cluster */
-static const uint16_t crc16tab[256] = {
-    0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50a5, 0x60c6, 0x70e7,
-    0x8108, 0x9129, 0xa14a, 0xb16b, 0xc18c, 0xd1ad, 0xe1ce, 0xf1ef,
-    0x1231, 0x0210, 0x3273, 0x2252, 0x52b5, 0x4294, 0x72f7, 0x62d6,
-    0x9339, 0x8318, 0xb37b, 0xa35a, 0xd3bd, 0xc39c, 0xf3ff, 0xe3de,
-    0x2462, 0x3443, 0x0420, 0x1401, 0x64e6, 0x74c7, 0x44a4, 0x5485,
-    0xa56a, 0xb54b, 0x8528, 0x9509, 0xe5ee, 0xf5cf, 0xc5ac, 0xd58d,
-    0x3653, 0x2672, 0x1611, 0x0630, 0x76d7, 0x66f6, 0x5695, 0x46b4,
-    0xb75b, 0xa77a, 0x9719, 0x8738, 0xf7df, 0xe7fe, 0xd79d, 0xc7bc,
-    0x4864, 0x5845, 0x6826, 0x7807, 0x08e0, 0x18c1, 0x28a2, 0x3883,
-    0xc96c, 0xd94d, 0xe92e, 0xf90f, 0x89e8, 0x99c9, 0xa9aa, 0xb98b,
-    0x5b55, 0x4b74, 0x7b17, 0x6b36, 0x1bd1, 0x0bf0, 0x3b93, 0x2bb2,
-    0xdb5d, 0xcb7c, 0xfb1f, 0xeb3e, 0x9bd9, 0x8bf8, 0xbb9b, 0xabba,
-    0x6ca6, 0x7c87, 0x4ce4, 0x5cc5, 0x2c22, 0x3c03, 0x0c60, 0x1c41,
-    0xedae, 0xfd8f, 0xcdec, 0xddcd, 0xad2a, 0xbd0b, 0x8d68, 0x9d49,
-    0x7e97, 0x6eb6, 0x5ed5, 0x4ef4, 0x3e13, 0x2e32, 0x1e51, 0x0e70,
-    0xff9f, 0xefbe, 0xdfdd, 0xcffc, 0xbf1b, 0xaf3a, 0x9f59, 0x8f78,
-    /* ... (tabella completa omessa per brevità — in produzione usa la versione full) */
-};
-
-static uint16_t crc16_fast(const char *buf, int len) {
-    uint16_t crc = 0;
-    for (int i = 0; i < len; i++) {
-        crc = (uint16_t)((crc << 8) ^ crc16tab[((crc >> 8) ^ (uint8_t)buf[i]) & 0xff]);
-    }
-    return crc;
-}
+/* PRIMA: qui c'era una crc16tab[256] con solo le prime 128 entry
+ * riempite (il resto azzerato implicitamente dalla dichiarazione
+ * dell'array — commento dell'autore: "tabella completa omessa per
+ * brevità") più una crc16_fast() che la usava. Nessuna delle due era
+ * mai chiamata: engine_worker_for_key() (sotto) usa DJB2, non CRC16,
+ * nonostante il commento nell'header dicesse il contrario (corretto
+ * separatamente in engine.h). Codice morto E rotto se mai risvegliato
+ * (valori CRC16 sbagliati per qualunque input che tocchi la seconda metà
+ * della tabella) — rimosso. Se in futuro serve CRC16 compatibile con lo
+ * slot-routing di Redis/NexCache Cluster, usare crc16() da crc16.c
+ * (tabella completa, già presente in questo codebase), non reintrodurre
+ * una copia parziale qui. */
 
 /* ── Variabile globale engine ───────────────────────────────── */
 NexEngine *g_engine = NULL;
@@ -236,8 +220,12 @@ int engine_auto_workers(void) {
 
 /* ── engine_create ──────────────────────────────────────────── */
 NexEngine *engine_create(int num_workers, int port, const char *bind_addr) {
-    NexEngine *engine = (NexEngine *)calloc(1, sizeof(NexEngine));
-    if (!engine) return NULL;
+    /* NexEngine/NexWorker/mpsc_node_t sono dichiarati aligned(256):
+     * calloc garantisce solo 16 byte su macOS — l'attributo di allineamento
+     * violato è UB per gli accessi atomici interni. Allochiamo allineato. */
+    NexEngine *engine = NULL;
+    if (posix_memalign((void **)&engine, 256, sizeof(NexEngine)) != 0) return NULL;
+    memset(engine, 0, sizeof(NexEngine));
 
     if (num_workers <= 0) num_workers = engine_auto_workers();
     if (num_workers > NEX_MAX_WORKERS) num_workers = NEX_MAX_WORKERS;

@@ -20,7 +20,7 @@ endif
 
 .SUFFIXES: .c .so .xo .o
 
-all: helloworld.so hellotype.so helloblock.so hellocluster.so hellotimer.so hellodict.so hellohook.so helloacl.so
+all: helloworld.so hellotype.so helloblock.so hellocluster.so hellotimer.so hellodict.so hellohook.so helloacl.so nexvector.so nexts_module.so nexbp_module.so
 
 .c.xo:
 	$(CC) -I. $(CFLAGS) $(SHOBJ_CFLAGS) -fPIC -c $< -o $@
@@ -64,6 +64,32 @@ helloacl.xo: ../nexcachemodule.h
 
 helloacl.so: helloacl.xo
 	$(LD) -o $@ $^ $(SHOBJ_LDFLAGS) $(LIBS) -lc
+
+nexvector.xo: ../nexcachemodule.h ../vector/hnsw.h
+
+nexvector.so: nexvector.xo
+	$(LD) -o $@ $^ $(SHOBJ_LDFLAGS) $(LIBS) -lpthread -lc
+
+# nexts.c non è compilato nel server principale (assente da src/Makefile
+# OBJS), quindi va compilato ed embeddato direttamente in questo modulo
+# invece di fare affidamento su dynamic_lookup contro nexcache-server.
+nexts.xo: ../timeseries/nexts.c ../timeseries/nexts.h
+	$(CC) -I. $(CFLAGS) $(SHOBJ_CFLAGS) -fPIC -c ../timeseries/nexts.c -o nexts.xo
+
+nexts_module.xo: ../nexcachemodule.h ../timeseries/nexts.h
+
+nexts_module.so: nexts_module.xo nexts.xo
+	$(LD) -o $@ $^ $(SHOBJ_LDFLAGS) $(LIBS) -lpthread -lc
+
+# reactive.c (backpressure streams) è nella stessa situazione di nexts.c:
+# non compilato nel server principale, va embeddato nel modulo.
+reactive.xo: ../streams/reactive.c ../streams/reactive.h
+	$(CC) -I. $(CFLAGS) $(SHOBJ_CFLAGS) -fPIC -c ../streams/reactive.c -o reactive.xo
+
+nexbp_module.xo: ../nexcachemodule.h ../streams/reactive.h
+
+nexbp_module.so: nexbp_module.xo reactive.xo
+	$(LD) -o $@ $^ $(SHOBJ_LDFLAGS) $(LIBS) -lpthread -lc
 
 clean:
 	rm -rf *.xo *.so

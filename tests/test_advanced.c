@@ -22,7 +22,15 @@
 
 /* Moduli da testare */
 #include "../src/cluster/cluster.h"
-#include "../src/consensus/raft.h"
+/* NOTA (scoperto 2026-08-07): src/consensus/raft.h non esiste in questa
+ * versione dell'albero sorgenti (NexCache-SOVEREIGN NV-RUBIN VERAM 4.0) —
+ * verificato, la cartella src/consensus/ non esiste affatto. Il modulo
+ * Raft Consensus era forse presente in una lineage diversa (VERAM3.3?)
+ * o pianificato ma mai portato qui. Suite 1 (test_raft) sotto è disattivata
+ * di conseguenza — non è possibile testare un modulo che non esiste nel
+ * codebase corrente. Se Raft Consensus è una feature voluta per SOVEREIGN,
+ * va prima implementata (src/consensus/raft.c/h + wiring), poi questa
+ * suite può essere riattivata. */
 #include "../src/persistence/persist.h"
 #include "../src/security/pqcrypto.h"
 #include "../src/vector/hnsw.h"
@@ -59,51 +67,8 @@ static int raft_apply_cb(const uint8_t *data, size_t len, void *ud) {
 }
 
 static void test_raft(void) {
-  printf("\n[Suite 1] Raft Consensus\n");
-
-  /* Init */
-  RaftState *r = raft_init(1, CONSENSUS_ASYNC, raft_apply_cb, NULL);
-  CHECK(r != NULL, "raft_init");
-
-  /* Start — cluster single-node → diventa leader */
-  int rc = raft_start(r);
-  CHECK(rc == 0, "raft_start");
-
-  /* Piccolo delay per il thread di elezione */
-  usleep(50000); /* 50ms */
-
-  /* Verifica ruolo leader (cluster single-node) */
-  CHECK(raft_is_leader(r), "is_leader after start (single-node)");
-  CHECK(raft_leader_id(r) == 1, "leader_id == self");
-
-  /* Write */
-  const char *cmd = "SET foo bar";
-  RaftWriteResult res;
-  rc = raft_write(r, (const uint8_t *)cmd, strlen(cmd), &res);
-  CHECK(rc == 0, "raft_write returns 0");
-  CHECK(res.success == 1, "raft_write committed");
-  CHECK(res.log_index == 1, "log_index == 1");
-
-  /* Seconda write */
-  rc = raft_write(r, (const uint8_t *)"SET bar baz", 11, &res);
-  CHECK(rc == 0 && res.log_index == 2, "second write log_index=2");
-
-  /* Snapshot compatta il log */
-  rc = raft_take_snapshot(r, NULL, 0);
-  CHECK(rc == 0, "raft_take_snapshot");
-
-  /* Aggiungi peer (non si connette davvero, solo struttura) */
-  rc = raft_add_peer(r, 2, "192.168.1.2", 7379, 0);
-  CHECK(rc == 0, "raft_add_peer");
-  CHECK(r->num_peers == 1, "num_peers == 1");
-
-  /* Witness peer */
-  rc = raft_add_peer(r, 3, "192.168.1.3", 7379, 1);
-  CHECK(rc == 0 && r->peers[1].is_witness == 1, "witness peer");
-
-  raft_destroy(r);
-  printf("  ✓ PASS raft_destroy (no leak)\n");
-  g_pass++;
+  printf("\n[Suite 1] Raft Consensus — SALTATA: src/consensus/raft.h non esiste "
+         "in questo codebase (vedi nota sopra gli #include)\n");
 }
 
 /* ──────────────────────────────────────────────────────────── */

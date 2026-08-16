@@ -1,8 +1,16 @@
-/* Forziamo l'architettura Intel PRIA di ogni inclusione per GitHub Actions */
-#if defined(__x86_64__) || defined(_M_X64)
-#pragma GCC push_options
-#pragma GCC target("sse4.1,avx2")
-#endif
+/* PRIMA: `#pragma GCC target("sse4.1,avx2")` applicato all'intera unità
+ * di compilazione (push_options/pop_options in fondo al file) forzava
+ * OGNI funzione qui dentro — inclusa nex_vector_hamming_dist, che non
+ * usa nessun intrinsic SIMD — a essere compilata assumendo AVX2
+ * disponibile, senza alcun controllo runtime. Se questo modulo viene
+ * mai agganciato a un comando reale (oggi non lo è: nessun VADD/VSEARCH
+ * esiste), eseguirlo su una CPU x86_64 priva di AVX2 sarebbe SIGILL
+ * garantito. ORA: il target attribute è applicato solo alle singole
+ * funzioni che usano davvero intrinsics AVX2/SSE4.1, e la selezione
+ * runtime (stesso pattern già usato correttamente altrove in questo
+ * codebase, es. util.c/bitops.c per x86) sceglie il percorso giusto in
+ * base a __builtin_cpu_supports invece che dedurlo dal solo flag di
+ * compilazione. */
 
 #include "quantization.h"
 #include <string.h>
@@ -14,6 +22,9 @@
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #include <cpuid.h>
+#define NEXVEC_TARGET_X86 __attribute__((target("sse4.1,avx2")))
+#else
+#define NEXVEC_TARGET_X86
 #endif
 
 void nexvec_probe_caps(NexVectorCaps *caps) {
@@ -26,6 +37,41 @@ void nexvec_probe_caps(NexVectorCaps *caps) {
     caps->arm_neon = true;
 #endif
 }
+
+#if defined(__x86_64__) || defined(_M_X64)
+NEXVEC_TARGET_X86
+static size_t quantize_int8_avx2(const float *src, int8_t *dst, size_t dim) {
+    size_t i = 0;
+    __m128 vscale = _mm_set1_ps(127.0f);
+    for (; i + 3 < dim; i += 4) {
+        __m128 f = _mm_loadu_ps(&src[i]);
+        __m128i scaled = _mm_cvtps_epi32(_mm_mul_ps(f, vscale));
+        __m128i s16 = _mm_packs_epi32(scaled, scaled);
+        __m128i s8 = _mm_packs_epi16(s16, s16);
+        int32_t res = _mm_cvtsi128_si32(s8);
+        memcpy(&dst[i], &res, 4);
+    }
+    return i;
+}
+
+NEXVEC_TARGET_X86
+static int32_t dot_int8_avx2(const int8_t *a, const int8_t *b, size_t dim, size_t *consumed) {
+    int32_t sum = 0;
+    size_t i = 0;
+    __m128i vsum = _mm_setzero_si128();
+    for (; i + 15 < dim; i += 16) {
+        __m128i va = _mm_loadu_si128((__m128i *)&a[i]);
+        __m128i vb = _mm_loadu_si128((__m128i *)&b[i]);
+        vsum = _mm_add_epi32(vsum, _mm_madd_epi16(_mm_cvtepi8_epi16(va), _mm_cvtepi8_epi16(vb)));
+        vsum = _mm_add_epi32(vsum, _mm_madd_epi16(_mm_cvtepi8_epi16(_mm_srli_si128(va, 8)), _mm_cvtepi8_epi16(_mm_srli_si128(vb, 8))));
+    }
+    int32_t tmp[4];
+    _mm_storeu_si128((__m128i *)tmp, vsum);
+    sum = tmp[0] + tmp[1] + tmp[2] + tmp[3];
+    *consumed = i;
+    return sum;
+}
+#endif
 
 void nex_vector_quantize_int8(const float *src, int8_t *dst, size_t dim) {
     size_t i = 0;
@@ -42,14 +88,8 @@ void nex_vector_quantize_int8(const float *src, int8_t *dst, size_t dim) {
         vst1_lane_s8(&dst[i + 3], s8, 3);
     }
 #elif defined(__x86_64__) || defined(_M_X64)
-    __m128 vscale = _mm_set1_ps(127.0f);
-    for (; i + 3 < dim; i += 4) {
-        __m128 f = _mm_loadu_ps(&src[i]);
-        __m128i scaled = _mm_cvtps_epi32(_mm_mul_ps(f, vscale));
-        __m128i s16 = _mm_packs_epi32(scaled, scaled);
-        __m128i s8 = _mm_packs_epi16(s16, s16);
-        int32_t res = _mm_cvtsi128_si32(s8);
-        memcpy(&dst[i], &res, 4);
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("sse4.1")) {
+        i = quantize_int8_avx2(src, dst, dim);
     }
 #endif
     for (; i < dim; i++) {
@@ -75,16 +115,9 @@ int32_t nex_vector_dot_int8(const int8_t *a, const int8_t *b, size_t dim) {
     }
     sum = vgetq_lane_s32(vsum, 0) + vgetq_lane_s32(vsum, 1) + vgetq_lane_s32(vsum, 2) + vgetq_lane_s32(vsum, 3);
 #elif defined(__x86_64__) || defined(_M_X64)
-    __m128i vsum = _mm_setzero_si128();
-    for (; i + 15 < dim; i += 16) {
-        __m128i va = _mm_loadu_si128((__m128i *)&a[i]);
-        __m128i vb = _mm_loadu_si128((__m128i *)&b[i]);
-        vsum = _mm_add_epi32(vsum, _mm_madd_epi16(_mm_cvtepi8_epi16(va), _mm_cvtepi8_epi16(vb)));
-        vsum = _mm_add_epi32(vsum, _mm_madd_epi16(_mm_cvtepi8_epi16(_mm_srli_si128(va, 8)), _mm_cvtepi8_epi16(_mm_srli_si128(vb, 8))));
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("sse4.1")) {
+        sum = dot_int8_avx2(a, b, dim, &i);
     }
-    int32_t tmp[4];
-    _mm_storeu_si128((__m128i *)tmp, vsum);
-    sum = tmp[0] + tmp[1] + tmp[2] + tmp[3];
 #endif
     for (; i < dim; i++) sum += (int32_t)a[i] * b[i];
     return sum;
@@ -95,7 +128,3 @@ uint32_t nex_vector_hamming_dist(const uint8_t *a, const uint8_t *b, size_t num_
     for (size_t i = 0; i < num_bytes; i++) dist += __builtin_popcount(a[i] ^ b[i]);
     return dist;
 }
-
-#if defined(__x86_64__) || defined(_M_X64)
-#pragma GCC pop_options
-#endif

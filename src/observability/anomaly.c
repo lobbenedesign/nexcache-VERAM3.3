@@ -20,7 +20,6 @@ static uint64_t anomaly_us_now(void) {
 /* ── MetricWindow helpers ────────────────────────────────────── */
 static void window_push(MetricWindow *w, double value) {
     if (w->count < ANOMALY_HISTORY_SIZE) {
-        w->samples[w->head] = value;
         w->count++;
     } else {
         w->sum -= w->samples[w->head];
@@ -164,6 +163,21 @@ static void *anomaly_monitor_thread(void *arg) {
         uint32_t hot_count = d->hot_key_tracker.top_count;
         char hot_key[64];
         strncpy(hot_key, d->hot_key_tracker.top_key, sizeof(hot_key) - 1);
+        hot_key[sizeof(hot_key) - 1] = '\0';
+        /* PRIMA: il reset avveniva ogni 60 tick (~60s) più sotto, fuori
+         * da questo lock e nested dentro l'if di alert (quindi a volte
+         * mai, se la soglia non scattava mai) — mentre hot_key_qps è
+         * documentato/confrontato come se top_count fosse già un rate al
+         * secondo. Un conteggio cumulativo fino a 60s confrontato con una
+         * soglia pensata per 1s faceva scattare l'alert fino a ~60 volte
+         * troppo presto rispetto al valore configurato. Resettare ogni
+         * tick (questo loop gira ogni 1s, vedi usleep sopra) rende
+         * top_count un vero rate al secondo, coerente con "QPS". Il
+         * reset avviene qui, ancora sotto d->lock, non dopo
+         * pthread_mutex_unlock come nella versione precedente — quella
+         * mutazione senza lock correva contro anomaly_record_key_access,
+         * che scrive nella stessa struttura sotto lock. */
+        memset(&d->hot_key_tracker, 0, sizeof(d->hot_key_tracker));
         pthread_mutex_unlock(&d->lock);
 
         /* ── Controlli anomalie ──────────────────────────────── */
@@ -189,9 +203,6 @@ static void *anomaly_monitor_thread(void *arg) {
             anomaly_emit(d, ANOMALY_HOT_KEY,
                          hot_count > d->config.hot_key_qps * 5 ? SEV_CRITICAL : SEV_WARNING,
                          hot_count, d->config.hot_key_qps, hot_key, desc);
-            /* Reset top key tracker ogni minuto */
-            if (tick % 60 == 0)
-                memset(&d->hot_key_tracker, 0, sizeof(d->hot_key_tracker));
         }
 
         /* 3. Memory leak: crescita > 10% in 5 minuti */

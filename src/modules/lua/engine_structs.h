@@ -11,8 +11,6 @@ typedef struct luaEngineCtx {
     char *nexcache_version;
     uint32_t nexcache_version_num;
     char *server_name;
-    char *nexcache_version;
-    uint32_t nexcache_version_num;
 
     int lua_enable_insecure_api;
 } luaEngineCtx;

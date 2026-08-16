@@ -40,7 +40,18 @@ static struct {
     pthread_t thread;
     NexDashboardInfo info;
     pthread_mutex_t info_lock;
+    DashboardConfig cfg;
 } g_dash;
+
+/* Confronto a tempo costante per il token della dashboard (stessa
+ * motivazione del fix in security/quota.c: evitare timing attack). */
+static int dash_token_equal(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    volatile uint8_t diff = (uint8_t)(la != lb);
+    size_t n = la < lb ? la : lb;
+    for (size_t i = 0; i < n; i++) diff |= (uint8_t)(a[i] ^ b[i]);
+    return diff == 0;
+}
 
 /* ── Utility ────────────────────────────────────────────────── */
 static uint64_t dash_us_now(void) {
@@ -226,6 +237,23 @@ static void handle_info(int client_fd) {
     send_http_response(client_fd, 200, "text/plain", body, (size_t)n);
 }
 
+/* Estrae il valore dell'header "Authorization: Bearer <token>" (o del
+ * token grezzo dopo "Authorization: ") dalla richiesta HTTP grezza. */
+static int extract_auth_token(const char *req, char *out, size_t out_cap) {
+    const char *h = strstr(req, "Authorization:");
+    if (!h) return 0;
+    h += strlen("Authorization:");
+    while (*h == ' ') h++;
+    if (strncmp(h, "Bearer ", 7) == 0) h += 7;
+    size_t i = 0;
+    while (h[i] && h[i] != '\r' && h[i] != '\n' && i < out_cap - 1) {
+        out[i] = h[i];
+        i++;
+    }
+    out[i] = '\0';
+    return i > 0;
+}
+
 /* ── Request dispatcher ─────────────────────────────────────── */
 static void handle_client(int client_fd) {
     char req[2048] = {0};
@@ -239,6 +267,20 @@ static void handle_client(int client_fd) {
     if (strcmp(method, "GET") != 0) {
         send_http_response(client_fd, 405, "text/plain", "Method not allowed", 19);
         return;
+    }
+
+    /* PRIMA: dashboard_init scartava cfg con (void)cfg — enable_auth/
+     * auth_token venivano ignorati e /health, /info (memoria usata, Raft
+     * term/node id, hit rate) erano raggiungibili senza credenziali da
+     * chiunque potesse instradare pacchetti verso la porta. */
+    if (g_dash.cfg.enable_auth) {
+        char token[128] = {0};
+        if (!extract_auth_token(req, token, sizeof(token)) ||
+            !dash_token_equal(token, g_dash.cfg.auth_token)) {
+            send_http_response(client_fd, 401, "application/json",
+                               "{\"error\":\"unauthorized\"}", 24);
+            return;
+        }
     }
 
     if (strcmp(path, "/") == 0 ||
@@ -281,9 +323,14 @@ static void *dashboard_thread(void *arg) {
 
 /* ── dashboard_init ─────────────────────────────────────────── */
 int dashboard_init(int port, DashboardConfig *cfg) {
-    (void)cfg;
-
     memset(&g_dash, 0, sizeof(g_dash));
+    if (cfg) g_dash.cfg = *cfg;
+    if (g_dash.cfg.bind_all && !g_dash.cfg.enable_auth) {
+        fprintf(stderr,
+                "[NexCache Dashboard] REFUSED: bind_all=1 richiede enable_auth=1 "
+                "(altrimenti la dashboard sarebbe esposta senza credenziali su tutte le interfacce)\n");
+        return -1;
+    }
     g_dash.port = port > 0 ? port : DASHBOARD_PORT_DEFAULT;
     g_dash.info.start_time_us = dash_us_now();
     snprintf(g_dash.info.raft_role, sizeof(g_dash.info.raft_role), "standalone");
@@ -300,7 +347,9 @@ int dashboard_init(int port, DashboardConfig *cfg) {
     struct sockaddr_in srv;
     memset(&srv, 0, sizeof(srv));
     srv.sin_family = AF_INET;
-    srv.sin_addr.s_addr = INADDR_ANY;
+    /* Default: solo loopback. bind_all=1 (validato sopra: richiede
+     * enable_auth) è l'unico modo di esporre la dashboard su 0.0.0.0. */
+    srv.sin_addr.s_addr = g_dash.cfg.bind_all ? INADDR_ANY : htonl(INADDR_LOOPBACK);
     srv.sin_port = htons((uint16_t)g_dash.port);
 
     if (bind(g_dash.listen_fd, (struct sockaddr *)&srv, sizeof(srv)) < 0) {
@@ -319,12 +368,14 @@ int dashboard_init(int port, DashboardConfig *cfg) {
     pthread_create(&g_dash.thread, NULL, dashboard_thread, NULL);
 
     fprintf(stderr,
-            "[NexCache Dashboard] Started on http://0.0.0.0:%d\n"
+            "[NexCache Dashboard] Started on http://%s:%d (auth=%s)\n"
             "  • /          → HTML Dashboard\n"
             "  • /metrics   → Prometheus\n"
             "  • /health    → Health check\n"
             "  • /info      → Full info\n",
-            g_dash.port);
+            g_dash.cfg.bind_all ? "0.0.0.0" : "127.0.0.1",
+            g_dash.port,
+            g_dash.cfg.enable_auth ? "enabled" : "disabled");
     return 0;
 }
 
