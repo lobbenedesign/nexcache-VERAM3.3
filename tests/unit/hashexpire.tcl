@@ -2458,7 +2458,16 @@ start_server {tags {"hashexpire external:skip"}} {
             set replica_2 [srv 0 client]
             set replica_2_host [srv 0 host]
             set replica_2_port [srv 0 port]
-            
+            # NEX-FIX: replica_2 is a brand-new server (this start_server block),
+            # unlike primary/replica_1 which still carry the notify-keyspace-events
+            # KEA set by the "Replication Primary -> R1" test above. Without this,
+            # replica_2 never emits keyspace notifications for the writes it applies
+            # via replication, so `assert_keyevent_patterns $rd_replica_2 ...` below
+            # blocks forever waiting for a message that was never going to arrive --
+            # observed as this test hitting the outer 1200s test timeout on CI
+            # instead of failing fast with a clear assertion message.
+            $replica_2 config set notify-keyspace-events KEA
+
             test {Chain Replication (Primary -> R1 -> R2) preserves TTL} {
                 $replica_1 replicaof $primary_host $primary_port
                 # Wait for R2 to connect to R1
