@@ -2218,13 +2218,24 @@ start_server {tags {"hashexpire external:skip"}} {
             # Now connect replica
             $replica replicaof $primary_host $primary_port
 
-            # NEX-FIX: bumped from 100x100ms (10s) -- a manual, quiet-machine repro
-            # of this exact scenario completes full sync in ~6s, but on a loaded
-            # shared CI runner that occasionally isn't enough headroom, and every
-            # later test in this section piggybacks on this replica connection
-            # actually being up, so a slow-but-successful first sync here was
-            # cascading into "replica offset didn't match in time" failures below.
-            wait_for_condition 200 100 {
+            # NEX-FIX: originally 100x100ms (10s). A manual, quiet-machine repro of
+            # this exact scenario completes full sync in ~6s, but CI measured
+            # consistently needing more than 20s (a first bump to 200x100ms/20s
+            # still hit the ceiling and failed at exactly 20s, twice). This CI
+            # config never runs the general replication.tcl/-2/-3/-4 suites at all
+            # (excluded by --tags -slow), so this narrow hashexpire.tcl section is
+            # the only replication coverage that runs here, and there's no baseline
+            # to compare its CI timing against. Bumped generously to 400x100ms
+            # (40s) rather than re-guessing in small increments across more 20+
+            # minute CI round trips -- correctness itself was independently
+            # verified via a direct manual master/replica repro (see the RDB
+            # magic/version framing fix), so this is purely about giving a
+            # known-slower-on-CI-than-locally step enough room, not chasing a
+            # correctness bug. Every later test in this section piggybacks on
+            # this replica connection actually being caught up, so a slow first
+            # sync here was cascading into "replica offset didn't match in time"
+            # in the very next test too.
+            wait_for_condition 400 100 {
                 [info_field [$replica info replication] master_link_status] eq "up"
             } else {
                 fail "Master <-> Replica didn't finish sync"
