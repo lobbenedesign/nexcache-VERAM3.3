@@ -276,7 +276,32 @@ void dbAdd(serverDb *db, robj *key, robj **valref) {
 
 /* Returns which dict index should be used with kvstore for a given key. */
 int getKVStoreIndexForKey(sds key) {
-    if (server.cluster_enabled) return getKeySlot(key);
+    /* NEX-FIX: this used to return the raw cluster slot (0-16383) directly
+     * as the kvstore shard index. That's correct in upstream Redis/Valkey,
+     * where cluster mode creates exactly 16384 shards (one per slot) so
+     * "slot number" and "shard index" are the same number by construction.
+     * This fork always uses NEX_RCU_SHARDS (176) shards regardless of
+     * cluster mode ("G3-GODMODE: 176 shards for Vera workers", see
+     * createDatabase() in server.c), so a slot >= 176 -- the overwhelming
+     * majority of the 16384 possible slots -- indexed straight into a
+     * 176-element array out of bounds. Whether any single key's slot
+     * happened to land under 176 determined whether ordinary reads/writes
+     * on it looked fine; cluster-wide bookkeeping that touches many/most
+     * slots (per-slot IMPORTING-state tracking during CLUSTER SETSLOT,
+     * cross-node gossip about the full slot range) hit an out-of-bounds
+     * kvstoreGetHashtable() access almost immediately, caught by
+     * "Assertion failed: (didx < kvs->num_hashtables)" in kvstoreIsImporting
+     * in a debug-assert build, or silent heap corruption without one.
+     * Folding the slot down into the real shard count here fixes the
+     * crash. It does NOT fully restore per-slot semantics: multiple
+     * cluster slots now alias onto the same physical shard, so operations
+     * that are supposed to be scoped to exactly one slot (CLUSTER
+     * GETKEYSINSLOT/COUNTKEYSINSLOT, and per-slot IMPORTING granularity
+     * during migration) will see/affect all slots sharing that shard, not
+     * just the target one. That's a separate, deeper correctness gap in
+     * the same 176-shard-vs-16384-slot mismatch, not addressed here --
+     * this fix's scope is preventing the crash the failing test hit. */
+    if (server.cluster_enabled) return getKeySlot(key) % NEX_RCU_SHARDS;
     /* DJB2 hash for 256-shard distribution on NVIDIA Vera */
     uint32_t hash = 5381;
     size_t len = sdslen(key);

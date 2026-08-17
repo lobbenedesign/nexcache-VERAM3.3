@@ -235,9 +235,24 @@ void setSlotImportingStateInDb(serverDb *db,
     while ((ln = listNext(&li)) != NULL) {
         slotRange *range = ln->value;
         for (int slot = range->start_slot; slot <= range->end_slot; slot++) {
-            kvstoreSetIsImporting(db->keys, slot, is_importing);
-            kvstoreSetIsImporting(db->expires, slot, is_importing);
-            kvstoreSetIsImporting(db->keys_with_volatile_items, slot,
+            /* NEX-FIX: same 176-shard-vs-16384-slot mismatch as
+             * getKVStoreIndexForKey() in db.c -- see the comment there for
+             * the full explanation. kvstoreSetIsImporting() indexes
+             * kvs->hashtables[didx] directly with no bounds check beyond an
+             * assert, so passing a raw slot >= NEX_RCU_SHARDS here is an
+             * out-of-bounds write/read, which is exactly what crashed the
+             * "Hash with TTL fields migrates correctly between nodes" test.
+             * Folding through % NEX_RCU_SHARDS matches the shard a key in
+             * this slot actually lives on. Multiple slots alias onto the
+             * same shard (16384/176 ~= 93 slots per shard), so this marks
+             * the whole shard importing/not-importing together rather than
+             * tracking each slot independently -- a known, deliberately
+             * deferred granularity gap in the same architectural mismatch,
+             * not a regression introduced by this fix. */
+            int didx = slot % NEX_RCU_SHARDS;
+            kvstoreSetIsImporting(db->keys, didx, is_importing);
+            kvstoreSetIsImporting(db->expires, didx, is_importing);
+            kvstoreSetIsImporting(db->keys_with_volatile_items, didx,
                                   is_importing);
         }
     }
