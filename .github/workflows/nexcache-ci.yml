@@ -1,5 +1,12 @@
 name: NexCache CI
 
+# NEX-NOTE: re-touched to force GitHub Actions to re-register this workflow.
+# It stopped showing up entirely under Actions (both the web UI and the API
+# reported zero workflows/runs for this repo, "could not find any workflows
+# named NexCache CI") despite the file being present and Actions being
+# enabled for the repo -- almost certainly related to the earlier ~6-hour
+# run that hit the job's hard time limit and got force-cancelled by GitHub.
+
 on:
   push:
     branches: [ main ]
