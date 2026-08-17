@@ -1470,16 +1470,42 @@ werr:
  * integer pointed by 'error' is set to the value of errno just after the I/O
  * error. */
 int rdbSaveRio(int req, int rdbver, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
-    char magic[10];
+    /* Must fit "NEXCACHE" (8) + a 4-digit version + NUL, with room to spare. */
+    char magic[16];
     uint64_t cksum;
     long key_counter = 0;
     int j;
 
     if (server.rdb_checksum) rdb->update_cksum = rioGenericUpdateChecksum;
-    const char *magic_prefix = rdbUseNexCacheMagic(rdbver) ? "NEXCACHE" : "NEXCACHE0";
+    /* NEX-FIX: the false branch was "NEXCACHE0", which the reader (rdb.c,
+     * rdbLoad) does not recognize as a legacy magic at all -- it only checks
+     * for "NEXCACHE" (8-byte, current format), "VALKEY" (6-byte), and
+     * "REDIS" (5-byte, the actual legacy/foreign-range magic for rdbver in
+     * [RDB_FOREIGN_VERSION_MIN, RDB_FOREIGN_VERSION_MAX], e.g. the RDB_VERSION=11
+     * fallback used whenever replicaRdbVersion() can't find a peer NexCache
+     * version >= 9.0.0 in RDB_VERSION_MAP -- which, given this product's own
+     * --version currently reports 1.0.0, is every negotiation today). Every
+     * replica handshake that landed on that fallback wrote a magic the
+     * reader couldn't recognize as legacy, so it fell through to the
+     * "NEXCACHE" 8-byte-prefix branch, read a version number 1-2 digits
+     * short of what was actually written, and rejected it as an
+     * unsupported version. */
+    const char *magic_prefix = rdbUseNexCacheMagic(rdbver) ? "NEXCACHE" : "REDIS";
     serverAssert(rdbver >= 0 && rdbver <= RDB_VERSION);
-    snprintf(magic, sizeof(magic), "%s%03d", magic_prefix, rdbver);
-    if (rdbWriteRaw(rdb, magic, 9) == -1) goto werr;
+    /* NEX-FIX: the reader (rdbLoad) expects exactly magic_len + 4 version
+     * digits -- its own comment says so: "We read 12 bytes to accommodate
+     * NEXCACHE0080 or VALKEY0011 or REDIS0011". This used to format with
+     * "%03d" (3 digits, not 4) and then write a hardcoded 9 bytes regardless
+     * -- a leftover from the old 5-byte "REDIS" + 4-digit-version framing,
+     * never updated when the magic grew to 8-byte "NEXCACHE". For
+     * RDB_VERSION=80 that wrote "NEXCACHE0" (the "080" got truncated to a
+     * single "0" by the fixed 9-byte write), which the reader parsed as
+     * version 0 -- always below the minimum accepted version, so every
+     * replica full sync failed with "Can't handle RDB format version 0".
+     * Format with %04d and write the real formatted length instead of a
+     * byte count sized for a magic string this code no longer uses. */
+    snprintf(magic, sizeof(magic), "%s%04d", magic_prefix, rdbver);
+    if (rdbWriteRaw(rdb, magic, strlen(magic)) == -1) goto werr;
     if (rdbSaveInfoAuxFields(rdb, rdbflags, rsi) == -1) goto werr;
     if (!(req & REPLICA_REQ_RDB_EXCLUDE_DATA) && rdbSaveModulesAux(rdb, NEXCACHEMODULE_AUX_BEFORE_RDB) == -1) goto werr;
 
@@ -3145,23 +3171,51 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
 
     rdb->update_cksum = rdbLoadProgressCallback;
     rdb->max_processing_chunk = server.loading_process_events_interval_bytes;
-    /* We read 12 bytes to accommodate "NEXCACHE0080" or "VALKEY0011" or "REDIS0011" */
-    if (rioRead(rdb, buf, 12) == 0) goto eoferr;
-    buf[12] = '\0';
-    if (memcmp(buf, "NEXCACHE", 8) == 0) {
-        is_nexcache_magic = true;
-        magic_len = 8;
-    } else if (memcmp(buf, "VALKEY", 6) == 0) {
-        is_legacy_magic = true;
-        magic_len = 6;
-    } else if (memcmp(buf, "REDIS", 5) == 0) {
+    /* NEX-FIX: this used to unconditionally rioRead() a fixed 12 bytes --
+     * enough for the longest header, "NEXCACHE0080" -- regardless of which
+     * magic was actually present. For the two shorter legacy headers,
+     * "REDIS0011" (9 bytes) and "VALKEY0011" (10 bytes), that silently
+     * consumed 3 (or 2) bytes belonging to the real payload that follows
+     * the header, since rio streams (this is also used to read live
+     * replication sockets, not just on-disk files) can't be seeked
+     * backwards to put the overread bytes back. Every full sync that
+     * legitimately negotiated down to the legacy RDB11 format (rather than
+     * this product's own RDB80/"NEXCACHE" format) got its payload
+     * misaligned from the very first opcode and failed to load with
+     * "Unexpected EOF" or "Wrong signature" a few keys in. Read only the
+     * shortest candidate magic first (5 bytes, "REDIS") and extend the read
+     * only as far as needed to confirm a longer one, so exactly magic_len +
+     * 4 version-digit bytes are ever consumed from the stream. */
+    if (rioRead(rdb, buf, 5) == 0) goto eoferr;
+    if (memcmp(buf, "REDIS", 5) == 0) {
         is_legacy_magic = true;
         magic_len = 5;
+    } else if (memcmp(buf, "VALKE", 5) == 0) {
+        if (rioRead(rdb, buf + 5, 1) == 0) goto eoferr;
+        if (memcmp(buf, "VALKEY", 6) != 0) {
+            buf[6] = '\0';
+            serverLog(LL_WARNING, "Wrong signature trying to load DB from file: %.6s", buf);
+            return RDB_INCOMPATIBLE;
+        }
+        is_legacy_magic = true;
+        magic_len = 6;
+    } else if (memcmp(buf, "NEXCA", 5) == 0) {
+        if (rioRead(rdb, buf + 5, 3) == 0) goto eoferr;
+        if (memcmp(buf, "NEXCACHE", 8) != 0) {
+            buf[8] = '\0';
+            serverLog(LL_WARNING, "Wrong signature trying to load DB from file: %.8s", buf);
+            return RDB_INCOMPATIBLE;
+        }
+        is_nexcache_magic = true;
+        magic_len = 8;
     } else {
-        serverLog(LL_WARNING, "Wrong signature trying to load DB from file: %.12s", buf);
+        buf[5] = '\0';
+        serverLog(LL_WARNING, "Wrong signature trying to load DB from file: %.5s", buf);
         /* Signal to terminate the rdbLoad without clearing existing data */
         return RDB_INCOMPATIBLE;
     }
+    if (rioRead(rdb, buf + magic_len, 4) == 0) goto eoferr;
+    buf[magic_len + 4] = '\0';
     rdbver = atoi(buf + magic_len);
     if (!rdbIsVersionAccepted(rdbver, is_nexcache_magic, is_legacy_magic)) {
         serverLog(LL_WARNING, "Can't handle RDB format version %d", rdbver);

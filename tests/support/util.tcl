@@ -501,7 +501,24 @@ proc roundFloat f {
 
 set ::last_port_attempted 0
 proc find_available_port {start count} {
-    set port [expr $start]
+    # NEX-FIX: this used to always restart the scan at $start. A bind-then-
+    # immediately-close probe (below) is inherently TOCTOU-racy against a
+    # real listener that's still winding down between test-server restarts:
+    # a bind can transiently succeed here even though the real spawn that
+    # follows genuinely fails with EADDRINUSE against that same port
+    # (confirmed live: a plain `socket -server 127.0.0.1 $port` succeeded
+    # against a port with an actual LISTENing nexcache-server on it).
+    # Always restarting from $start meant every retry re-offered the exact
+    # same falsely-available port, so wait_server_started's real "Failed
+    # listening on port" detection and this loop fought each other forever
+    # instead of ever converging -- observed as a 6-hour CI hang. Continuing
+    # the scan from just past the last port we handed out is enough to
+    # break that cycle without weakening the probe itself.
+    if {$::last_port_attempted > 0} {
+        set port [expr $::last_port_attempted + 1]
+    } else {
+        set port [expr $start]
+    }
     # use a larger count range directly here
     set count 1000
     for {set attempts 0} {$attempts < $count} {incr attempts} {
