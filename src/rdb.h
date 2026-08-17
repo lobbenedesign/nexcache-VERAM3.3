@@ -133,8 +133,20 @@ enum RdbType {
 /* NOTE: WHEN ADDING NEW RDB TYPE, UPDATE rdb_type_string[] */
 
 /* When our RDB format diverges, we need to reject types/opcodes for which we
- * may have assigned a different meaning compared to other implementations. */
-#define RDB_FOREIGN_TYPE_MIN 22
+ * may have assigned a different meaning compared to other implementations.
+ *
+ * NEX-FIX: this used to hardcode 22 as the reserved range's lower bound, but
+ * 22 is RDB_TYPE_HASH_2 itself (see above: "Hash with field-level
+ * expiration, RDB 80 (9.0)") -- the newest, legitimately-used real type in
+ * this build, not a foreign one. That made the loader reject every hash
+ * with a field-level TTL the moment it arrived over replication (or via
+ * RESTORE/DUMP) with "Can't handle foreign type or opcode 22 in RDB with
+ * version 80", even from another instance of this exact same build. Derive
+ * the lower bound from RDB_TYPE_LAST (the sentinel right after the highest
+ * real type) instead of a magic number frozen at whatever RDB_TYPE_HASH_2's
+ * value happened to be, so this can't silently go stale again the next time
+ * a real type is added here. */
+#define RDB_FOREIGN_TYPE_MIN RDB_TYPE_LAST
 #define RDB_FOREIGN_TYPE_MAX 243
 
 /* Test if a type is an object type. */

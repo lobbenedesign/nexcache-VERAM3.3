@@ -232,12 +232,36 @@ int replicaRdbVersion(client *replica) {
             return RDB_VERSION_MAP[i][0];
         }
     }
-    /* Fallback to RDB 11, which was introduced in 7.2.
+    /* NEX-FIX: this used to unconditionally fall back to RDB 11 here, on the
+     * assumption that reaching this point (no RDB_VERSION_MAP entry matched)
+     * means the peer is a genuinely ancient pre-7.2 client that never
+     * reported a version at all. That assumption breaks for this product:
+     * NexCache's own --version reports "1.0.0" (its own product versioning,
+     * unrelated to the historical 7.2.0/9.0.0 NexCache-lineage scale this
+     * table is built around), so it never matches any table entry and always
+     * fell through to the RDB11 fallback -- even when both peers are the
+     * exact same build. RDB 11 is described a few lines up as "the last
+     * open-source NexCache RDB version" and predates hash field-level TTL
+     * support entirely: any hash with a HEXPIRE'd field can't be encoded in
+     * it at all, so the primary's BGSAVE child aborted with "Can't store key
+     * ... in RDB version 11" the moment a test hash had one, closing the
+     * connection out from under the replica mid-handshake -- which surfaced
+     * as a confusing "I/O error reading bulk count from PRIMARY: Success"
+     * (a genuine EOF, not a timeout or a race) and looked at first like CI
+     * being slower than a local repro, until the primary's own log showed
+     * the real BGSAVE failure at the same timestamp.
      *
-     * 7.2 and older don't report their version. If no version was provided, we
-     * assume it's 7.2. We don't currently produce RDB 10 (7.0) and RDB 9
-     * (5.0--6.2). */
-    return 11;
+     * Every peer that reaches this fallback already demonstrated
+     * REPLICA_CAPA_EOF (checked at the top of this function) -- a
+     * comparatively modern diskless-transfer capability -- so treating an
+     * unrecognized-but-present version as "ancient, needs RDB11" was already
+     * a stretch. Default to this build's own RDB_VERSION instead, matching
+     * the reasoning already used a few lines up for the no-CAPA_EOF case
+     * ("don't want to write an old RDB version ... force the latest"). A
+     * real pre-7.2 Redis/Valkey replica reporting no version at all would
+     * still need explicit handling if one is ever expected to connect here,
+     * but that's a different, currently-unencountered case from this one. */
+    return RDB_VERSION;
 }
 
 /* Replication: Primary side - connections association.
