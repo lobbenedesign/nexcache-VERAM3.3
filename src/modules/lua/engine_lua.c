@@ -204,9 +204,16 @@ static struct luaEngineCtx *createEngineContext(NexCacheModuleCtx *ctx) {
 static void destroyEngineContext(luaEngineCtx *lua_engine_ctx) {
     lua_close(lua_engine_ctx->eval_lua);
     lua_close(lua_engine_ctx->function_lua);
+    /* NEX-FIX: nexcache_version was freed here a second time (a copy-paste
+     * duplicate of the line above it) -- luaEngineCtx only has two freeable
+     * pointer fields (nexcache_version, server_name; nexcache_version_num is
+     * a uint32_t, not a pointer), so there was never a missing third field
+     * to justify a second free() call here, just a genuine double-free. This
+     * corrupted the heap allocator's internal state on every clean server
+     * shutdown, crashing with SIGABRT inside malloc (free_tiny_botch on
+     * macOS) from NexCacheModule_OnUnload -> destroyEngineContext. */
     NexCacheModule_Free(lua_engine_ctx->nexcache_version);
     NexCacheModule_Free(lua_engine_ctx->server_name);
-    NexCacheModule_Free(lua_engine_ctx->nexcache_version);
     NexCacheModule_Free(lua_engine_ctx);
 }
 
