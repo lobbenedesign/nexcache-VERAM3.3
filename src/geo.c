@@ -518,21 +518,21 @@ void geoaddCommand(client *c) {
 
 #define RADIUS_COORDS (1 << 0)  /* Search around coordinates. */
 #define RADIUS_MEMBER (1 << 1)  /* Search around member. */
-#define RADIUS_NOSTORE (1 << 2) /* Do not accept STORE/STONEXCACHET option. */
+#define RADIUS_NOSTORE (1 << 2) /* Do not accept STORE/STOREDIST option. */
 #define GEOSEARCH (1 << 3)      /* GEOSEARCH command variant (different arguments supported) */
-#define GEOSEARCHSTORE (1 << 4) /* GEOSEARCHSTORE just accept STONEXCACHET option */
+#define GEOSEARCHSTORE (1 << 4) /* GEOSEARCHSTORE just accept STOREDIST option */
 
 /* GEORADIUS key x y radius unit [WITHDIST] [WITHHASH] [WITHCOORD] [ASC|DESC]
- *                               [COUNT count [ANY]] [STORE key|STONEXCACHET key]
+ *                               [COUNT count [ANY]] [STORE key|STOREDIST key]
  * GEORADIUSBYMEMBER key member radius unit ... options ...
  * GEOSEARCH key [FROMMEMBER member] [FROMLONLAT long lat] [BYRADIUS radius unit]
  *               [BYBOX width height unit] [WITHCOORD] [WITHDIST] [WITHASH] [COUNT count [ANY]] [ASC|DESC]
  * GEOSEARCHSTORE dest_key src_key [FROMMEMBER member] [FROMLONLAT long lat] [BYRADIUS radius unit]
- *               [BYBOX width height unit] [COUNT count [ANY]] [ASC|DESC] [STONEXCACHET]
+ *               [BYBOX width height unit] [COUNT count [ANY]] [ASC|DESC] [STOREDIST]
  *  */
 void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
     robj *storekey = NULL;
-    int stonexcachet = 0; /* 0 for STORE, 1 for STONEXCACHET. */
+    int storedist = 0; /* 0 for STORE, 1 for STOREDIST. */
 
     /* Look up the requested zset */
     robj *zobj = lookupKeyRead(c->db, c->argv[srcKeyIndex]);
@@ -604,15 +604,15 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
             } else if (!strcasecmp(arg, "store") && (i + 1) < remaining && !(flags & RADIUS_NOSTORE) &&
                        !(flags & GEOSEARCH)) {
                 storekey = c->argv[base_args + i + 1];
-                stonexcachet = 0;
+                storedist = 0;
                 i++;
-            } else if (!strcasecmp(arg, "stonexcachet") && (i + 1) < remaining && !(flags & RADIUS_NOSTORE) &&
+            } else if (!strcasecmp(arg, "storedist") && (i + 1) < remaining && !(flags & RADIUS_NOSTORE) &&
                        !(flags & GEOSEARCH)) {
                 storekey = c->argv[base_args + i + 1];
-                stonexcachet = 1;
+                storedist = 1;
                 i++;
-            } else if (!strcasecmp(arg, "stonexcachet") && (flags & GEOSEARCH) && (flags & GEOSEARCHSTORE)) {
-                stonexcachet = 1;
+            } else if (!strcasecmp(arg, "storedist") && (flags & GEOSEARCH) && (flags & GEOSEARCHSTORE)) {
+                storedist = 1;
             } else if (!strcasecmp(arg, "frommember") && (i + 1) < remaining && flags & GEOSEARCH && !fromloc && !bypolygon) {
                 /* No source key, proceed with argument parsing and return an error when done. */
                 if (zobj == NULL) {
@@ -675,7 +675,7 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
         }
     }
 
-    /* Trap options not compatible with STORE and STONEXCACHET. */
+    /* Trap options not compatible with STORE and STOREDIST. */
     if (storekey && (withdist || withhash || withcoords)) {
         addReplyErrorFormat(c, "%s is not compatible with WITHDIST, WITHHASH and WITHCOORD options",
                             flags & GEOSEARCHSTORE ? "GEOSEARCHSTORE" : "STORE option in GEORADIUS");
@@ -819,7 +819,7 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
             zskiplistNode *znode;
             geoPoint *gp = ga.array + i;
             gp->dist /= shape.conversion; /* Fix according to unit. */
-            double score = stonexcachet ? gp->dist : gp->score;
+            double score = storedist ? gp->dist : gp->score;
             size_t elelen = sdslen(gp->member);
 
             if (maxelelen < elelen) maxelelen = elelen;

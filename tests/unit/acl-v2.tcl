@@ -424,10 +424,10 @@ start_server {tags {"acl external:skip"}} {
         assert_equal "OK" [r ACL DRYRUN command-test EVAL "" 3 rw read]
 
         # Test GEORADIUS which uses the last type of keyspec, keyword
-        assert_equal "OK" [r ACL DRYRUN command-test GEORADIUS read longitude latitude radius M STONEXCACHET write]
+        assert_equal "OK" [r ACL DRYRUN command-test GEORADIUS read longitude latitude radius M STOREDIST write]
         assert_equal "OK" [r ACL DRYRUN command-test GEORADIUS read longitude latitude radius M]
-        assert_match {*has no permissions to access the 'read2' key*} [r ACL DRYRUN command-test GEORADIUS read1 longitude latitude radius M STONEXCACHET read2]
-        assert_match {*has no permissions to access the 'write1' key*} [r ACL DRYRUN command-test GEORADIUS write1 longitude latitude radius M STONEXCACHET write2]
+        assert_match {*has no permissions to access the 'read2' key*} [r ACL DRYRUN command-test GEORADIUS read1 longitude latitude radius M STOREDIST read2]
+        assert_match {*has no permissions to access the 'write1' key*} [r ACL DRYRUN command-test GEORADIUS write1 longitude latitude radius M STOREDIST write2]
         assert_equal "OK" [r ACL DRYRUN command-test GEORADIUS read longitude latitude radius M STORE write]
         assert_equal "OK" [r ACL DRYRUN command-test GEORADIUS read longitude latitude radius M]
         assert_match {*has no permissions to access the 'read2' key*} [r ACL DRYRUN command-test GEORADIUS read1 longitude latitude radius M STORE read2]

@@ -248,8 +248,8 @@
                 ]
             },
             {
-                "name": "stonexcachet",
-                "token": "STONEXCACHET",
+                "name": "storedist",
+                "token": "STOREDIST",
                 "type": "pure-token",
                 "optional": true
             }

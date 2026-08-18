@@ -2959,7 +2959,7 @@ int migrateGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResu
 
 /* Helper function to extract keys from following commands:
  * GEORADIUS key x y radius unit [WITHDIST] [WITHHASH] [WITHCOORD] [ASC|DESC]
- *                             [COUNT count] [STORE key|STONEXCACHET key]
+ *                             [COUNT count] [STORE key|STOREDIST key]
  * GEORADIUSBYMEMBER key member radius unit ... options ...
  *
  * This command has a fully defined keyspec, so returning flags isn't needed. */
@@ -2972,11 +2972,11 @@ int georadiusGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysRe
     int stored_key = -1;
     for (i = 5; i < argc; i++) {
         char *arg = objectGetVal(argv[i]);
-        /* For the case when user specifies both "store" and "stonexcachet" options, the
+        /* For the case when user specifies both "store" and "storedist" options, the
          * second key specified would override the first key. This behavior is kept
          * the same as in georadiusCommand method.
          */
-        if ((!strcasecmp(arg, "store") || !strcasecmp(arg, "stonexcachet")) && ((i + 1) < argc)) {
+        if ((!strcasecmp(arg, "store") || !strcasecmp(arg, "storedist")) && ((i + 1) < argc)) {
             stored_key = i + 1;
             i++;
         }

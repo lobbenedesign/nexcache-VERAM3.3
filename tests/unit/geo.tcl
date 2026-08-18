@@ -263,8 +263,8 @@ start_server {tags {"geo"}} {
         set e
     } {ERR *exactly one of BYRADIUS, BYBOX and BYPOLYGON*}
 
-    test {GEOSEARCH with STONEXCACHET option} {
-        catch {r geosearch nyc fromlonlat -73.9798091 40.7598464 bybox 6 6 km asc stonexcachet} e
+    test {GEOSEARCH with STOREDIST option} {
+        catch {r geosearch nyc fromlonlat -73.9798091 40.7598464 bybox 6 6 km asc storedist} e
         set e
     } {ERR *syntax*}
 
@@ -492,14 +492,14 @@ start_server {tags {"geo"}} {
         assert_equal [r zrange points{t} 0 -1] [r zrange points2{t} 0 -1]
     }
 
-    test {GEORADIUSBYMEMBER STORE/STONEXCACHET option: plain usage} {
+    test {GEORADIUSBYMEMBER STORE/STOREDIST option: plain usage} {
         r del points{t}
         r geoadd points{t} 13.361389 38.115556 "Palermo" 15.087269 37.502669 "Catania"
 
         r georadiusbymember points{t} Palermo 500 km store points2{t}
         assert_equal {Palermo Catania} [r zrange points2{t} 0 -1]
 
-        r georadiusbymember points{t} Catania 500 km stonexcachet points2{t}
+        r georadiusbymember points{t} Catania 500 km storedist points2{t}
         assert_equal {Catania Palermo} [r zrange points2{t} 0 -1]
 
         set res [r zrange points2{t} 0 -1 withscores]
@@ -512,35 +512,35 @@ start_server {tags {"geo"}} {
         assert_equal [r zrange points{t} 0 -1] [r zrange points2{t} 0 -1]
     }
 
-    test {GEORANGE STONEXCACHET option: plain usage} {
+    test {GEORANGE STOREDIST option: plain usage} {
         r del points{t}
         r geoadd points{t} 13.361389 38.115556 "Palermo" \
                            15.087269 37.502669 "Catania"
-        r georadius points{t} 13.361389 38.115556 500 km stonexcachet points2{t}
+        r georadius points{t} 13.361389 38.115556 500 km storedist points2{t}
         set res [r zrange points2{t} 0 -1 withscores]
         assert {[lindex $res 1] < 1}
         assert {[lindex $res 3] > 166}
         assert {[lindex $res 3] < 167}
     }
 
-    test {GEOSEARCHSTORE STONEXCACHET option: plain usage} {
-        r geosearchstore points2{t} points{t} fromlonlat 13.361389 38.115556 byradius 500 km stonexcachet
+    test {GEOSEARCHSTORE STOREDIST option: plain usage} {
+        r geosearchstore points2{t} points{t} fromlonlat 13.361389 38.115556 byradius 500 km storedist
         set res [r zrange points2{t} 0 -1 withscores]
         assert {[lindex $res 1] < 1}
         assert {[lindex $res 3] > 166}
         assert {[lindex $res 3] < 167}
     }
 
-    test {GEORANGE STONEXCACHET option: COUNT ASC and DESC} {
+    test {GEORANGE STOREDIST option: COUNT ASC and DESC} {
         r del points{t}
         r geoadd points{t} 13.361389 38.115556 "Palermo" \
                            15.087269 37.502669 "Catania"
-        r georadius points{t} 13.361389 38.115556 500 km stonexcachet points2{t} asc count 1
+        r georadius points{t} 13.361389 38.115556 500 km storedist points2{t} asc count 1
         assert {[r zcard points2{t}] == 1}
         set res [r zrange points2{t} 0 -1 withscores]
         assert {[lindex $res 0] eq "Palermo"}
 
-        r georadius points{t} 13.361389 38.115556 500 km stonexcachet points2{t} desc count 1
+        r georadius points{t} 13.361389 38.115556 500 km storedist points2{t} desc count 1
         assert {[r zcard points2{t}] == 1}
         set res [r zrange points2{t} 0 -1 withscores]
         assert {[lindex $res 0] eq "Catania"}
@@ -592,7 +592,7 @@ start_server {tags {"geo"}} {
         set res [r GEOSEARCH points BYPOLYGON 11 151.21619137411474 -33.869643764947696 151.20408853981647 -33.87845382042545 151.2123775086366 -33.87864711938855 151.21046943124387 -33.87588862400425 151.21701035939626 -33.874286511854834 151.2239557405701 -33.8735722632175 151.22495056246407 -33.87893571656996 151.2274447496748 -33.882307713036354 151.23212935868654 -33.88136096120022 151.23097291274465 -33.87456240592362 151.22475424781445 -33.87099633192101 WITHDIST WITHCOORD ASC]
         assert_equal {{{The Reg Bartley Oval, Waratah Street, Rushcutters Bay, Sydney, Council of the City of Sydney, New South Wales, 2011, Australia} 858.3013 {151.22953444719314575 -33.87483862514310573}} {{Goodhope Street, Five Ways, Paddington, Eastern Suburbs, Sydney, Woollahra Municipal Council, New South Wales, 2021, Australia} 929.4979 {151.22852593660354614 -33.88116782387797343}} {{146, Elizabeth Street, Koreatown, Sydney, Sydney CBD, Sydney, Council of the City of Sydney, New South Wales, 2000, Australia} 1035.7735 {151.20932132005691528 -33.87772313782243572}}} $res
         # Success Case for GEOSEARCHSTORE
-        r geosearchstore "{points}dest" points  BYPOLYGON 11 151.21619137411474 -33.869643764947696 151.20408853981647 -33.87845382042545 151.2123775086366 -33.87864711938855 151.21046943124387 -33.87588862400425 151.21701035939626 -33.874286511854834 151.2239557405701 -33.8735722632175 151.22495056246407 -33.87893571656996 151.2274447496748 -33.882307713036354 151.23212935868654 -33.88136096120022 151.23097291274465 -33.87456240592362 151.22475424781445 -33.87099633192101 ASC STONEXCACHET COUNT 2
+        r geosearchstore "{points}dest" points  BYPOLYGON 11 151.21619137411474 -33.869643764947696 151.20408853981647 -33.87845382042545 151.2123775086366 -33.87864711938855 151.21046943124387 -33.87588862400425 151.21701035939626 -33.874286511854834 151.2239557405701 -33.8735722632175 151.22495056246407 -33.87893571656996 151.2274447496748 -33.882307713036354 151.23212935868654 -33.88136096120022 151.23097291274465 -33.87456240592362 151.22475424781445 -33.87099633192101 ASC STOREDIST COUNT 2
         assert_equal {{The Reg Bartley Oval, Waratah Street, Rushcutters Bay, Sydney, Council of the City of Sydney, New South Wales, 2011, Australia} {Goodhope Street, Five Ways, Paddington, Eastern Suburbs, Sydney, Woollahra Municipal Council, New South Wales, 2021, Australia}} [r zrange "{points}dest" 0 -1]
     }
 
