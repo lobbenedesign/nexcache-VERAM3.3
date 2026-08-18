@@ -143,16 +143,25 @@ start_server {tags {"scripting"}} {
 
     if {$is_eval eq 1 && $script_compatibility_api == "nexcache"} {
     # eval sha is only relevant for is_eval Lua
+    # NEX-FIX: baa8a86dfd5ab65f12f3d5be31f8cefdb7228456 is sha1("return
+    # nexcache.call('get',KEYS[1])"), matching the script literally run
+    # above. The old hash (fd758d1589d044dd850a6f05d52f2eefd27f033f) is
+    # sha1("return redis.call('get',KEYS[1])") -- a leftover from before
+    # this fork renamed the scripting API from redis.call to nexcache.call/
+    # server.call and never recomputed the hardcoded hash to match, so the
+    # script cache genuinely never contained a script under that sha and
+    # EVALSHA always raised NOSCRIPT (confirmed: this test aborted the
+    # whole file on every run, not just intermittently).
     test {EVALSHA - Can we call a SHA1 if already defined?} {
-        r evalsha fd758d1589d044dd850a6f05d52f2eefd27f033f 1 mykey
+        r evalsha baa8a86dfd5ab65f12f3d5be31f8cefdb7228456 1 mykey
     } {myval}
 
     test {EVALSHA_RO - Can we call a SHA1 if already defined?} {
-        r evalsha_ro fd758d1589d044dd850a6f05d52f2eefd27f033f 1 mykey
+        r evalsha_ro baa8a86dfd5ab65f12f3d5be31f8cefdb7228456 1 mykey
     } {myval}
 
     test {EVALSHA - Can we call a SHA1 in uppercase?} {
-        r evalsha FD758D1589D044DD850A6F05D52F2EEFD27F033F 1 mykey
+        r evalsha BAA8A86DFD5AB65F12F3D5BE31F8CEFDB7228456 1 mykey
     } {myval}
 
     test {EVALSHA - Do we get an error on invalid SHA1?} {
@@ -600,16 +609,16 @@ start_server {tags {"scripting"}} {
         r set mykey myval
 
         r script load {return nexcache.call('get',KEYS[1])}
-        set v [r evalsha fd758d1589d044dd850a6f05d52f2eefd27f033f 1 mykey]
+        set v [r evalsha baa8a86dfd5ab65f12f3d5be31f8cefdb7228456 1 mykey]
         assert_equal $v myval
         r script flush
-        assert_error {NOSCRIPT*} {r evalsha fd758d1589d044dd850a6f05d52f2eefd27f033f 1 mykey}
+        assert_error {NOSCRIPT*} {r evalsha baa8a86dfd5ab65f12f3d5be31f8cefdb7228456 1 mykey}
 
         r eval {return nexcache.call('get',KEYS[1])} 1 mykey
-        set v [r evalsha fd758d1589d044dd850a6f05d52f2eefd27f033f 1 mykey]
+        set v [r evalsha baa8a86dfd5ab65f12f3d5be31f8cefdb7228456 1 mykey]
         assert_equal $v myval
         r script flush
-        assert_error {NOSCRIPT*} {r evalsha fd758d1589d044dd850a6f05d52f2eefd27f033f 1 mykey}
+        assert_error {NOSCRIPT*} {r evalsha baa8a86dfd5ab65f12f3d5be31f8cefdb7228456 1 mykey}
     }
 
 
@@ -1328,7 +1337,11 @@ start_server {tags {"scripting"}} {
         # 1. eval "while 1 do nexcache.call('ping') end" 0
         # 2. ping
         if {$is_eval == 1} {
-            set buf "*3\r\n\$4\r\neval\r\n\$33\r\nwhile 1 do nexcache.call('ping') end\r\n\$1\r\n0\r\n"
+            # NEX-FIX: length prefix was still "$33" (the byte length of the
+            # upstream "while 1 do redis.call('ping') end" script) after this
+            # fork renamed the API to nexcache.call, which is 3 bytes longer
+            # (36 bytes) -- another malformed-RESP leftover from the rename.
+            set buf "*3\r\n\$4\r\neval\r\n\$36\r\nwhile 1 do nexcache.call('ping') end\r\n\$1\r\n0\r\n"
             append buf "*1\r\n\$4\r\nping\r\n"
         } else {
             set buf "*4\r\n\$8\r\nfunction\r\n\$4\r\nload\r\n\$7\r\nreplace\r\n\$99\r\n#!lua name=test\nserver.register_function('test', function() while 1 do server.call('ping') end end)\r\n"
@@ -1451,13 +1464,20 @@ start_server {tags {"scripting"}} {
     start_server {tags {"scripting repl needs:debug external:skip"}} {
         start_server {} {
             test "Before the replica connects we issue two EVAL commands" {
+                # NEX-FIX: both SHAs below were recomputed from the literal
+                # script text -- they were leftover sha1("redis.call(...)")
+                # values from before this fork renamed the scripting API to
+                # nexcache.call/server.call (see the same fix earlier in this
+                # file for the "EVALSHA - Can we call a SHA1" test), so
+                # EVALSHA below always raised NOSCRIPT against a script that
+                # was never actually cached under that hash.
                 # One with an error, but still executing a command.
-                # SHA is: 67164fc43fa971f76fd1aaeeaf60c1c178d25876
+                # SHA is: f5be060f05276ef61b9f7b9c48afc6b67a0893ec
                 catch {
                     run_script {nexcache.call('incr',KEYS[1]); nexcache.call('nonexisting')} 1 x
                 }
                 # One command is correct:
-                # SHA is: 6f5ade10a69975e903c6d07b10ea44c6382381a5
+                # SHA is: f464fea20830abdd24b3c303bd304416fda0aba4
                 run_script {return nexcache.call('incr',KEYS[1])} 1 x
             } {2}
 
@@ -1476,9 +1496,9 @@ start_server {tags {"scripting"}} {
                 # The server should replicate successful and unsuccessful
                 # commands as EVAL instead of EVALSHA.
                 catch {
-                    r evalsha 67164fc43fa971f76fd1aaeeaf60c1c178d25876 1 x
+                    r evalsha f5be060f05276ef61b9f7b9c48afc6b67a0893ec 1 x
                 }
-                r evalsha 6f5ade10a69975e903c6d07b10ea44c6382381a5 1 x
+                r evalsha f464fea20830abdd24b3c303bd304416fda0aba4 1 x
             } {4}
 
             test "'x' should be '4' for EVALSHA being replicated by effects" {
@@ -1511,8 +1531,8 @@ start_server {tags {"scripting"}} {
             test "EVALSHA replication when first call is readonly" {
                 r del x
                 r eval {if tonumber(ARGV[1]) > 0 then nexcache.call('incr', KEYS[1]) end} 1 x 0
-                r evalsha 6e0e2745aa546d0b50b801a20983b70710aef3ce 1 x 0
-                r evalsha 6e0e2745aa546d0b50b801a20983b70710aef3ce 1 x 1
+                r evalsha 858bfd9ed481ff2e928a61bda7a3f2ccd64f1492 1 x 0
+                r evalsha 858bfd9ed481ff2e928a61bda7a3f2ccd64f1492 1 x 1
                 wait_for_condition 50 100 {
                     [r -1 get x] eq {1}
                 } else {
@@ -1680,7 +1700,14 @@ start_server {tags {"scripting needs:debug external:skip"}} {
     test {Test scripting debug lua stack overflow} {
         r script debug sync
         r eval {return 'hello'} 0
-        set cmd "*101\r\n\$5\r\nnexcache\r\n"
+        # NEX-FIX: the bulk-string length prefix here was still "$5" (the
+        # length of "redis") after this fork renamed the debug-console
+        # placeholder command from "redis" to "nexcache" (8 bytes), so the
+        # request itself was a malformed RESP payload -- the server correctly
+        # rejected it with a protocol error instead of ever reaching the
+        # "Unknown command called from script" handling this test actually
+        # exercises. Match the prefix to the real length.
+        set cmd "*101\r\n\$8\r\nnexcache\r\n"
         append cmd [string repeat "\$4\r\ntest\r\n" 100]
         r write $cmd
         r flush

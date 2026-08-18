@@ -1397,6 +1397,19 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor, int slot,
         if (onlydidx == -1 && o == NULL && use_pattern && server.cluster_enabled) {
             onlydidx = patternHashSlot(pat, patlen);
         }
+        /* NEX-FIX: both `slot` (explicit CLUSTERSCAN target) and
+         * patternHashSlot()'s return are raw cluster slot numbers
+         * (0-16383), which upstream can pass straight through as a kvstore
+         * shard index because cluster mode there allocates exactly 16384
+         * shards. This fork always uses NEX_RCU_SHARDS (176) shards, so an
+         * unmapped slot >= 176 indexed past the end of the shard array --
+         * reproduced by "SCAN MATCH pattern implies cluster slot" and any
+         * cluster-mode CLUSTERSCAN targeting slot >= 176, which crashed with
+         * SIGABRT in kvstoreGetFairRandomHashtableIndex's assert. Same root
+         * cause and fix as getKVStoreIndexForKey() in this file and
+         * setSlotImportingStateInDb() in cluster_migrateslots.c; -1 (no
+         * slot restriction) must pass through unchanged. */
+        if (onlydidx >= 0) onlydidx %= NEX_RCU_SHARDS;
         do {
             /* In cluster mode there is a separate dictionary for each slot.
              * If cursor is empty, we should try exploring next non-empty slot. */

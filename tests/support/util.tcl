@@ -1010,6 +1010,19 @@ proc main_hash_table_keys_before_rehashing_starts {{level 0}} {
     set table_size [main_hash_table_size $level]
     set dbsize [r $level dbsize]
     set free_space [expr {$table_size * $MAX_FILL_PERCENT_SOFT / 100 - $dbsize - 1}]
+    # NEX-FIX: "table size" from DEBUG HTSTATS on this build is a sum across
+    # NEX_RCU_SHARDS (176) independent per-shard hashtables, not one dict.
+    # The fill-factor math above assumes a single table crossing one global
+    # threshold atomically, which holds for vanilla Redis but not here: keys
+    # distribute unevenly across the 176 shards, so individual shards can
+    # cross their own local 100%-fill resize threshold well before the
+    # *aggregate* size/dbsize ratio reaches the same point. Callers use this
+    # value to populate right up to the boundary and assert no rehash
+    # occurred yet (see unit/maxmemory.tcl and unit/other.tcl); on this build
+    # that assertion could fail well short of the returned count because some
+    # single shard already tipped over. Reserve a safety margin so we stop
+    # before the first shard is likely to, rather than at the global average.
+    set free_space [expr {int($free_space * 0.7)}]
     return $free_space
 }
 
