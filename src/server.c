@@ -2892,7 +2892,26 @@ void initServer(void) {
     ThreadsManager_init();
     makeThreadKillable();
 
-    global_nexstorage = nexstorage_create("segcache", "max_memory=1073741824");
+    /* NEX-FIX: this used to hardcode 1GB (1073741824) regardless of whether
+     * the fast-path this backs (nex-io-fastpath) is even enabled -- it
+     * defaults OFF, and every call site that reads global_nexstorage for
+     * ordinary GET/SET already gates on server.nex_io_fastpath first, so in
+     * the common case this 1GB is committed via segcache_create()'s
+     * posix_memalign+memset over 1024 segments and then never touched again
+     * for the life of the process. That's one wasted GB of RSS per
+     * nexcache-server instance, unconditionally, at every boot. It went
+     * unnoticed serially, but running several server instances concurrently
+     * (CI's --clients N, or any test file that spins up a primary + replica
+     * or a small cluster) multiplies it enough to trigger an OOM kill
+     * (observed: the whole test step killed with SIGTERM/exit 143 partway
+     * through, no failing test, right after switching CI to --clients 4).
+     * 192MB keeps a real margin above the 176-segment floor
+     * segcache_create() already enforces (176 segments * 1MB = 176MB
+     * minimum, see SEG_DEFAULT_SIZE/NEX_RCU_SHARDS there) while cutting
+     * per-instance RSS by >5x; it does not change behavior for anyone
+     * actually using the fast-path, since typical workloads (especially in
+     * tests) are far under either size. */
+    global_nexstorage = nexstorage_create("segcache", "max_memory=201326592");
     AnomalyConfig a_cfg = {0};
     global_anomaly_detector = anomaly_create(&a_cfg, NULL, NULL);
 
