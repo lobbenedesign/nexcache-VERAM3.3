@@ -60,17 +60,25 @@ jobs:
         # was killed by GitHub itself at almost exactly 60 minutes with conclusion
         # "cancelled", not "failure" or a timeout-minutes message -- that's this
         # runner/plan's hard per-job ceiling, which timeout-minutes cannot raise.
-        # So the real fix is making the run itself finish under ~60 minutes:
-        #  1. unit/violations.tcl (repeated 5-10GB single-command payloads) is now
-        #     tagged slow and properly excluded by --tags -slow below -- it wasn't
-        #     before, and was almost certainly the single biggest contributor.
-        #  2. --clients 1 (serial) was originally chosen specifically to dodge a
-        #     race in TTL/replication tests -- but that race was root-caused this
-        #     branch to tests/support/util.tcl's find_available_port re-offering
-        #     an already-occupied port between two test files' servers (see the
-        #     fix there), not to running test files concurrently per se. With that
-        #     fixed, running a modest number of clients in parallel is safe and
-        #     directly buys back wall-clock time; 4 is a conservative step up from
-        #     fully serial, not the large client counts (16+) some Redis CI setups
-        #     use, to keep any remaining cross-file interaction risk low.
-        ./runtest --verbose --tags -slow --dump-logs --timeout 1200 --clients 4
+        #
+        # Tried bumping to --clients 4 to buy back wall-clock time (the race that
+        # originally justified --clients 1 was root-caused to find_available_port
+        # reusing an occupied port between test files' servers, now fixed in
+        # tests/support/util.tcl, so file-level concurrency looked safe on paper).
+        # In practice run 32149619848 hung outright partway through a unit/type
+        # list.tcl fuzz test under --clients 4 and was eventually killed with no
+        # useful diagnostic (job "completed"/"failure" with an empty steps list) --
+        # never reproduced under --clients 1. This codebase's storage layer uses
+        # its own custom concurrency primitives (see the "VLL" / "Zero-mutex
+        # transactions" / "Predictive lock ordering" banner logged at boot), which
+        # is exactly the kind of thing file-level test parallelism can expose in
+        # ways a single serial client never will. Given the uncertainty, reverted
+        # to --clients 1 rather than debug a possible product concurrency bug via
+        # CI iteration; unit/violations.tcl's now-fixed slow tag (its repeated
+        # 5-10GB single-command payloads were almost certainly the single biggest
+        # serial-time contributor) is relied on instead to fit under the ~60
+        # minute ceiling. If that's still not enough, the next step should be
+        # splitting test files across multiple independent GitHub Actions jobs
+        # (matrix), not raising --clients again -- that parallelizes without
+        # touching how any single server instance is exercised.
+        ./runtest --verbose --tags -slow --dump-logs --timeout 1200 --clients 1
