@@ -128,6 +128,16 @@ static inline void update_zmalloc_stat_alloc(size_t size) {
     }
 }
 
+/* Credit `size` bytes to zmalloc's tracked usage without actually
+ * allocating anything. For call sites that must bypass zmalloc for the
+ * allocation itself (e.g. posix_memalign() for an alignment zmalloc can't
+ * provide) but whose memory is later released the normal way (zfree(),
+ * which always debits the tracker) -- without this, that debit has no
+ * matching credit and used_memory drifts down forever. */
+void zmalloc_used_memory_add(size_t size) {
+    update_zmalloc_stat_alloc(size);
+}
+
 static inline void update_zmalloc_stat_free(size_t size) {
     if (unlikely(thread_index == -1)) zmalloc_register_thread_index();
     if (unlikely(thread_index >= MAX_THREADS_NUM)) {
