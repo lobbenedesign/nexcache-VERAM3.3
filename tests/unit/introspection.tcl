@@ -1274,7 +1274,17 @@ start_server {tags {"introspection"}} {
             rdma-rx-size
             rdma-bind
             rdma-port
+            nex-engine-workers
+            nexcache-node-id
+            enable-debug-assert
         }
+        # NEX-FIX: nex-engine-workers, nexcache-node-id, and
+        # enable-debug-assert are NexCache-specific IMMUTABLE_CONFIG entries
+        # (config.c) that were never added to skip_configs above, so this
+        # test's round-trip CONFIG SET over every key from CONFIG GET *
+        # always failed on the first one it hit ("can't set immutable
+        # config"), aborting the whole test file before any later test in it
+        # could run.
 
         if {!$::tls} {
             append skip_configs {
