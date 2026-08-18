@@ -51,7 +51,7 @@ jobs:
         ./src/nexcache-server --version
 
     - name: Run Core Tests (Stabilized)
-      timeout-minutes: 25
+      timeout-minutes: 150
       run: |
         # Usiamo --clients 1 per evitare race condition sui test TTL/Replication in CI
         # Timeout alzato a 1200 per gestire carichi pesanti in VERA-Mode
@@ -62,6 +62,15 @@ jobs:
         # find_available_port kept re-offering an already-occupied port between two
         # test files' servers, spinning "Port N was already busy, trying another
         # port..." for the full 6-hour GitHub Actions job cap before being killed).
-        # Root cause not yet isolated; this turns a repeat into a fast, visible
-        # failure instead of another silent 6-hour hang.
+        # That root cause is now fixed (see find_available_port in util.tcl), so
+        # this cap no longer needs to protect against a silent runaway -- it now
+        # just needs to fit one full, legitimately slow, --clients 1 (serial, to
+        # avoid TTL/replication race conditions) run of all 147 non-"slow"-tagged
+        # test files. Measured directly: with the maxmemory/scripting/scan/
+        # introspection fixes landed, run 32138329913 reached file 38/147 (having
+        # finished unit/scripting.tcl, ~19 minutes alone) at the 25-minute mark
+        # with no failures, only timing out because 25 minutes was never enough
+        # for the full serial suite once it stopped dying early to earlier bugs.
+        # 150 minutes gives that a solid multiple of headroom without leaving the
+        # job effectively unbounded.
         ./runtest --verbose --tags -slow --dump-logs --timeout 1200 --clients 1
