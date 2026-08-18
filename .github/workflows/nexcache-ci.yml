@@ -53,24 +53,24 @@ jobs:
     - name: Run Core Tests (Stabilized)
       timeout-minutes: 150
       run: |
-        # Usiamo --clients 1 per evitare race condition sui test TTL/Replication in CI
         # Timeout alzato a 1200 per gestire carichi pesanti in VERA-Mode
         #
-        # timeout-minutes above is a hard wall-clock cap on this whole step: --timeout
-        # 1200 only bounds tclsh's own per-test accounting, not a runaway retry loop
-        # outside any single test (observed once: tests/support/util.tcl's
-        # find_available_port kept re-offering an already-occupied port between two
-        # test files' servers, spinning "Port N was already busy, trying another
-        # port..." for the full 6-hour GitHub Actions job cap before being killed).
-        # That root cause is now fixed (see find_available_port in util.tcl), so
-        # this cap no longer needs to protect against a silent runaway -- it now
-        # just needs to fit one full, legitimately slow, --clients 1 (serial, to
-        # avoid TTL/replication race conditions) run of all 147 non-"slow"-tagged
-        # test files. Measured directly: with the maxmemory/scripting/scan/
-        # introspection fixes landed, run 32138329913 reached file 38/147 (having
-        # finished unit/scripting.tcl, ~19 minutes alone) at the 25-minute mark
-        # with no failures, only timing out because 25 minutes was never enough
-        # for the full serial suite once it stopped dying early to earlier bugs.
-        # 150 minutes gives that a solid multiple of headroom without leaving the
-        # job effectively unbounded.
-        ./runtest --verbose --tags -slow --dump-logs --timeout 1200 --clients 1
+        # timeout-minutes above is this STEP's cap, but it turns out not to be the
+        # binding constraint: run 32140877578 (--clients 1, timeout-minutes: 150)
+        # was killed by GitHub itself at almost exactly 60 minutes with conclusion
+        # "cancelled", not "failure" or a timeout-minutes message -- that's this
+        # runner/plan's hard per-job ceiling, which timeout-minutes cannot raise.
+        # So the real fix is making the run itself finish under ~60 minutes:
+        #  1. unit/violations.tcl (repeated 5-10GB single-command payloads) is now
+        #     tagged slow and properly excluded by --tags -slow below -- it wasn't
+        #     before, and was almost certainly the single biggest contributor.
+        #  2. --clients 1 (serial) was originally chosen specifically to dodge a
+        #     race in TTL/replication tests -- but that race was root-caused this
+        #     branch to tests/support/util.tcl's find_available_port re-offering
+        #     an already-occupied port between two test files' servers (see the
+        #     fix there), not to running test files concurrently per se. With that
+        #     fixed, running a modest number of clients in parallel is safe and
+        #     directly buys back wall-clock time; 4 is a conservative step up from
+        #     fully serial, not the large client counts (16+) some Redis CI setups
+        #     use, to keep any remaining cross-file interaction risk low.
+        ./runtest --verbose --tags -slow --dump-logs --timeout 1200 --clients 4
