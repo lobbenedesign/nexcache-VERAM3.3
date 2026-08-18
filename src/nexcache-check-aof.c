@@ -359,8 +359,21 @@ int fileIsRDB(char *filepath) {
     }
 
     if (size >= 8) { /* There must be at least room for the RDB header. */
-        char sig[5];
-        int rdb_file = fread(sig, sizeof(sig), 1, fp) == 1 && memcmp(sig, "NEXCACHE", sizeof(sig)) == 0;
+        /* NEX-FIX: sig was declared as char[5] (room for the legacy 5-byte
+         * "REDIS" magic) but compared with memcmp(sig, "NEXCACHE",
+         * sizeof(sig)) -- sizeof(sig) is 5, the *array's* size, not
+         * strlen("NEXCACHE") -- so this only ever compared the first 5
+         * bytes of "NEXCACHE" ("NEXCA") against the file, and never
+         * recognized "REDIS" at all. Every legacy-magic RDB-preamble AOF
+         * (this fork's own format before the "NEXCACHE" rename, still a
+         * valid preamble format worth detecting) got misclassified as a
+         * plain RESP-command AOF instead, and then failed to parse as one.
+         * Read the full 8-byte header room and check each candidate magic's
+         * own real prefix length within it. */
+        char sig[8];
+        int rdb_file = fread(sig, sizeof(sig), 1, fp) == 1 &&
+                       (memcmp(sig, "NEXCACHE", 8) == 0 || memcmp(sig, "REDIS", 5) == 0 ||
+                        memcmp(sig, "VALKEY", 6) == 0);
         if (rdb_file) {
             fclose(fp);
             return 1;

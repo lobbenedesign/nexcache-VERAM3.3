@@ -615,21 +615,63 @@ int nexcache_check_rdb(char *rdbfilename, FILE *fp) {
     rioInitWithFile(&rdb, fp);
     rdbstate.rio = &rdb;
     rdb.update_cksum = rdbLoadProgressCallback;
-    if (rioRead(&rdb, buf, 9) == 0) goto eoferr;
-    buf[9] = '\0';
-    bool is_nexcache_magic = false;
-    if (memcmp(buf, "NEXCACHE0", 6) == 0) {
+    /* NEX-FIX: this used to always read a fixed 9 bytes and parse the
+     * version from a hardcoded offset of 6 -- both sized for the legacy
+     * 5-char "REDIS" magic (5 + 4 version digits = 9, version starting at
+     * byte 5... except this literally used 6, off by one even for that
+     * case). It was never updated for this fork's 8-char "NEXCACHE" magic:
+     * with only 9 bytes read, a real "NEXCACHE0010" header only yields
+     * "NEXCACHE0" here, and atoi(buf + 6) reads starting at "HE0" (not a
+     * number) instead of "0010", always producing rdbver=0 and failing
+     * every real RDB/AOF-preamble file with "Can't handle RDB format
+     * version 0" -- reproduced exactly by tests/assets/rdb-preamble.aof.
+     * Mirror rdbLoadRioWithLoadingCtx()'s incremental read in rdb.c: read
+     * only the shortest candidate magic first and extend exactly as far as
+     * needed to confirm a longer one, so magic_len is always correct before
+     * reading the 4 version digits that follow it, and share
+     * rdbIsVersionAccepted() rather than re-deriving its bounds checks. */
+    bool is_nexcache_magic = false, is_legacy_magic = false;
+    int magic_len = 0;
+    if (rioRead(&rdb, buf, 5) == 0) goto eoferr;
+    if (memcmp(buf, "REDIS", 5) == 0) {
+        is_legacy_magic = true;
+        magic_len = 5;
+    } else if (memcmp(buf, "VALKE", 5) == 0) {
+        if (rioRead(&rdb, buf + 5, 1) == 0) goto eoferr;
+        if (memcmp(buf, "VALKEY", 6) != 0) {
+            rdbCheckError("Wrong signature trying to load DB from file");
+            goto err;
+        }
+        is_legacy_magic = true;
+        magic_len = 6;
+    } else if (memcmp(buf, "NEXCA", 5) == 0) {
+        if (rioRead(&rdb, buf + 5, 3) == 0) goto eoferr;
+        if (memcmp(buf, "NEXCACHE", 8) != 0) {
+            rdbCheckError("Wrong signature trying to load DB from file");
+            goto err;
+        }
         is_nexcache_magic = true;
-    } else if (memcmp(buf, "NEXCACHE", 6) == 0) {
-        is_nexcache_magic = true;
+        magic_len = 8;
     } else {
         rdbCheckError("Wrong signature trying to load DB from file");
         goto err;
     }
-    rdbver = atoi(buf + 6);
-    if (rdbver < 1 ||
-        (rdbver < RDB_FOREIGN_VERSION_MIN && !is_nexcache_magic) ||
-        (rdbver > RDB_FOREIGN_VERSION_MAX && !is_nexcache_magic)) {
+    if (rioRead(&rdb, buf + magic_len, 4) == 0) goto eoferr;
+    buf[magic_len + 4] = '\0';
+    rdbver = atoi(buf + magic_len);
+    /* NEX-FIX: rdbIsVersionAccepted() also gates foreign/future versions on
+     * server.rdb_version_check (default RDB_VERSION_CHECK_STRICT), which is
+     * the right call for the *loading* path but wrong here: this diagnostic
+     * tool's whole purpose is to report on out-of-range versions rather than
+     * hard-reject them (see the "RDB looks OK, but loading requires config
+     * 'rdb-version-check relaxed'" message a few lines down in
+     * nexcache_check_rdb_main(), which is unreachable if this errors out
+     * first). Reject only genuinely invalid combinations -- a version below
+     * 1, or a magic/version pairing that doesn't match how this fork's own
+     * magics map to version ranges -- and let the informational branches
+     * below handle merely-foreign or merely-future versions. */
+    (void)is_legacy_magic; /* only is_nexcache_magic constrains the valid version range here */
+    if (rdbver < 1 || (is_nexcache_magic && rdbver <= RDB_FOREIGN_VERSION_MAX)) {
         rdbCheckError("Can't handle RDB format version %d", rdbver);
         goto err;
     } else if (rdbver > RDB_VERSION) {

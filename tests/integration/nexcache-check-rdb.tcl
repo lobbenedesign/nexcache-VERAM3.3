@@ -32,7 +32,7 @@ tags {"check-rdb external:skip logreqres:skip"} {
         catch {
             exec $::NEXCACHE_CHECK_RDB_BIN tests/assets/encodings-rdb987.rdb
         } result
-        assert_match {*\[offset ?\] Future RDB version 987 detected*} $result
+        assert_match {*\[offset ??\] Future RDB version 987 detected*} $result
         assert_match {*\[offset ???\] \\o/ RDB looks OK, but loading requires config 'rdb-version-check relaxed'*} $result
     }
 
@@ -40,7 +40,7 @@ tags {"check-rdb external:skip logreqres:skip"} {
         catch {
             exec $::NEXCACHE_CHECK_RDB_BIN tests/assets/encodings-rdb987-unknown-types.rdb
         } result
-        assert_match {*\[offset ?\] Future RDB version 987 detected*} $result
+        assert_match {*\[offset ??\] Future RDB version 987 detected*} $result
         assert_match {*--- RDB ERROR DETECTED ---*} $result
         assert_match {*\[offset ??\] Unknown object type 150 in RDB file with future version 987*} $result
         assert_no_match {*RDB looks OK*} $result
