@@ -6069,7 +6069,17 @@ sds genNexCacheInfoString(dict *section_dict, int all_sections, int everything) 
         info = sdscatfmt(
             info,
             "# Server\r\n" FMTARGS(
-                "nexcache_version:%s\r\n", NEXCACHE_VERSION,
+                /* NEX-FIX: this used to be a duplicate "nexcache_version" line
+                 * (an artifact of a blind redis->nexcache rename that clobbered
+                 * the original "redis_version" field). Restoring it as
+                 * "redis_version" with the redis-API-compat version number is
+                 * what redis-cli's cliGetServerVersion() and third-party
+                 * clients expect: command/arg "since" tags throughout
+                 * commands.def are on the upstream Redis version scale, not
+                 * NexCache's own product version, so the CLI's legacy
+                 * (COMMAND-DOCS-unavailable) help path needs this field to
+                 * correctly decide which args/commands are supported. */
+                "redis_version:%s\r\n", NEXCACHE_COMPAT_VERSION,
                 "server_name:%s\r\n", SERVER_NAME,
                 "nexcache_version:%s\r\n", NEXCACHE_VERSION,
                 "nexcache_release_stage:%s\r\n", NEXCACHE_RELEASE_STAGE,

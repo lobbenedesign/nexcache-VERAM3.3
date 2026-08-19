@@ -643,7 +643,13 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
                 shape.type = RECTANGLE_TYPE;
                 bybox = 1;
                 i += 3;
-            } else if (!strcasecmp(arg, "bypolygon") && (i + 2) < remaining && flags & GEOSEARCH && !byradius && !bybox && !frommember && !fromloc) {
+            } else if (!strcasecmp(arg, "bypolygon") && (i + 2) < remaining && flags & GEOSEARCH && !byradius && !bybox) {
+                /* NEX-FIX: this used to also require !frommember && !fromloc,
+                 * making BYPOLYGON impossible to use together with the
+                 * FROMMEMBER/FROMLONLAT origin it depends on (see the
+                 * mandatory-origin check below) -- it should only be
+                 * mutually exclusive with BYRADIUS/BYBOX, like they are with
+                 * each other and with it. */
                 int num_vertices = 0;
                 if (getIntFromObjectOrReply(c, c->argv[base_args + i + 1], &num_vertices, "invalid number of vertices") != C_OK) {
                     return;

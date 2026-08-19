@@ -437,9 +437,23 @@ static void cliLegacyIntegrateHelp(void) {
      * don't already match what we have. */
     for (size_t j = 0; j < reply->elements; j++) {
         nexcacheReply *entry = reply->element[j];
+        /* NEX-FIX: this used `return` here, aborting enrichment for every
+         * remaining command in the reply the moment a single entry didn't
+         * match the expected shape -- not `continue`, which is what "fill
+         * only the entries that don't already match what we have" (see the
+         * comment above the loop) actually calls for. Server COMMAND output
+         * order isn't guaranteed, so whichever command happened to come
+         * first with an unexpected shape silently starved every command
+         * after it of hint data. Reproduced by the CLI's own
+         * --test_hint_file self-test when connected as a user without
+         * COMMAND DOCS permission (the "old server" fallback path this
+         * function exists for): most commands' hints came back empty
+         * (16/69 passing) even though their data was present in
+         * cli_commands.c, because the loop bailed out long before reaching
+         * them. */
         if (entry->type != NEXCACHE_REPLY_ARRAY || entry->elements < 4 || entry->element[0]->type != NEXCACHE_REPLY_STRING ||
             entry->element[1]->type != NEXCACHE_REPLY_INTEGER || entry->element[3]->type != NEXCACHE_REPLY_INTEGER)
-            return;
+            continue;
         char *cmdname = entry->element[0]->str;
         int i;
 
@@ -836,7 +850,13 @@ static size_t cliLegacyCountCommands(struct commandDocs *commands, sds version) 
  * Stores the result in config.server_version.
  * When not connected, or not possible, returns NULL. */
 static sds cliGetServerVersion(void) {
-    static const char *key = "\nnexcache_version:";
+    /* NEX-FIX: must read "redis_version" (the redis-API-compat version), not
+     * "nexcache_version" (NexCache's own product version). commands.def's
+     * per-command/per-arg "since" tags are on the upstream Redis version
+     * scale; comparing them against the product version ("1.0.0") caused
+     * versionIsSupported() to reject almost every command/arg, leaving the
+     * legacy (COMMAND-DOCS-unavailable) CLI help empty for most commands. */
+    static const char *key = "\nredis_version:";
     nexcacheReply *serverInfo = NULL;
     char *pos;
 
@@ -854,7 +874,7 @@ static sds cliGetServerVersion(void) {
     assert(serverInfo->type == NEXCACHE_REPLY_STRING || serverInfo->type == NEXCACHE_REPLY_VERB);
     sds info = serverInfo->str;
 
-    /* Finds the first appearance of "nexcache_version" in the INFO SERVER reply. */
+    /* Finds the first appearance of "redis_version" in the INFO SERVER reply. */
     pos = strstr(info, key);
     if (pos) {
         pos += strlen(key);

@@ -13,6 +13,12 @@
  * When the version is released the status will be "ga". */
 #define NEXCACHE_RELEASE_STAGE "ga"
 
-/* NexCache OSS compatibility version for clients that check for specific versions. */
-#define NEXCACHE_COMPAT_VERSION "7.2.4"
-#define NEXCACHE_COMPAT_VERSION_NUM 0x00070204
+/* NexCache OSS compatibility version for clients that check for specific versions.
+ * NEX-FIX: was stuck at 7.2.4 while commands.def already declared (and geo.c/
+ * t_string.c already implement) features tagged with later "since" versions
+ * (e.g. SET IFEQ since 8.1.0, GEOSEARCH BYPOLYGON since 9.0.0) -- bumped to
+ * match what is actually implemented, so version-gated help/arg filtering
+ * (see cliLegacyInitCommandHelpEntry -> removeUnsupportedArgs) doesn't hide
+ * working functionality from clients that check this version. */
+#define NEXCACHE_COMPAT_VERSION "9.0.0"
+#define NEXCACHE_COMPAT_VERSION_NUM 0x00090000
