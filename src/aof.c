@@ -1437,8 +1437,19 @@ int loadSingleAppendOnlyFile(char *filename) {
     /* Check if the AOF file is in RDB format (it may be RDB encoded base AOF
      * or old style RDB-preamble AOF). In that case we need to load the RDB file
      * and later continue loading the AOF tail if it is an old style RDB-preamble AOF. */
-    char sig[6]; /* "NEXCACHE" or "NEXCACHE" */
-    if (fread(sig, 1, 6, fp) != 6 || (memcmp(sig, "NEXCACHE0", 6) != 0 && memcmp(sig, "NEXCACHE", 6) != 0)) {
+    /* NEX-FIX: this used to read only 6 bytes and compare against
+     * "NEXCACHE0"[:6] and "NEXCACHE"[:6] -- both collapse to the same
+     * 6-byte prefix "NEXCAC", an artifact of a blind redis->nexcache
+     * rename. That never matches a legacy "REDIS"-magic RDB preamble (an
+     * old-style AOF file that starts with an RDB snapshot base), so such
+     * files fell through to the "not RDB, seek back to 0" branch and got
+     * parsed as raw AOF/RESP commands instead -- the RDB header bytes are
+     * not valid RESP, so loading failed immediately with "Bad file format
+     * reading the append only file". Check for all three magics this
+     * fork's RDB loader actually accepts (see rdb.c). */
+    char sig[8];
+    if (fread(sig, 1, 8, fp) != 8 ||
+        (memcmp(sig, "NEXCACHE", 8) != 0 && memcmp(sig, "REDIS", 5) != 0 && memcmp(sig, "VALKEY", 6) != 0)) {
         /* Not in RDB format, seek back at 0 offset. */
         if (fseek(fp, 0, SEEK_SET) == -1) goto readerr;
     } else {
