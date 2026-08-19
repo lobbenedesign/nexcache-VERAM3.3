@@ -2853,10 +2853,19 @@ bool dbsHaveNoKeys(void) {
 
 serverDb *createDatabase(int id) {
     int slot_count = 176; // G3-GODMODE: 176 shards for Vera workers
-    int flags = KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND;
-    if (server.cluster_enabled) {
-        flags |= KVSTORE_FREE_EMPTY_HASHTABLES;
-    }
+    /* NEX-FIX: KVSTORE_FREE_EMPTY_HASHTABLES used to be gated on
+     * server.cluster_enabled, inherited from upstream where standalone mode
+     * has exactly one internal shard (freeing it when empty would just
+     * force an immediate reallocation on the next write, so upstream only
+     * bothers for the many mostly-empty per-slot dicts of cluster mode).
+     * This fork always creates NEX_RCU_SHARDS (176) independent per-shard
+     * hashtables regardless of cluster mode, so standalone instances have
+     * the exact same "many small shards, most far from full" shape cluster
+     * mode does -- gating this flag left every shard that ever held a key
+     * permanently pinned at its largest-ever bucket-table size in
+     * standalone mode, since kvstoreTryResizeHashtables()'s shrink path
+     * checks this flag before actually freeing an emptied shard's table. */
+    int flags = KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND | KVSTORE_FREE_EMPTY_HASHTABLES;
 
     serverDb *db = zcalloc(sizeof(serverDb));
     db->keys = kvstoreCreate(&kvstoreKeysHashtableType, slot_count, flags);
