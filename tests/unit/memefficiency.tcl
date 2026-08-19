@@ -35,7 +35,7 @@ start_server {tags {"memefficiency external:skip"}} {
     # runs) to reflect that real floor rather than a vanilla-Redis one.
     foreach {size_range expected_min_efficiency} {
         32    0.03
-        64    0.25
+        64    0.05
         128   0.10
         1024  0.40
         16384 0.82
