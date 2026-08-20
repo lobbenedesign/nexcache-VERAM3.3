@@ -266,22 +266,27 @@ void setCommand(client *c) {
         return;
     }
 
-    c->argv[2] = tryObjectEncoding(c->argv[2]);
+    /* NEX-PERF: use the keyed-set variant -- setGenericCommand() always
+     * attaches key to this value via setKey() a few lines down, so a
+     * plain tryObjectEncoding() here would embed the value only to have
+     * objectSetKeyAndExpire() (object.c) immediately discard that and
+     * build a new, key-carrying object. */
+    c->argv[2] = tryObjectEncodingForKeyedSet(c->argv[2]);
     setGenericCommand(c, flags, c->argv[1], c->argv[2], expire, unit, NULL, NULL, comparison);
 }
 
 void setnxCommand(client *c) {
-    c->argv[2] = tryObjectEncoding(c->argv[2]);
+    c->argv[2] = tryObjectEncodingForKeyedSet(c->argv[2]);
     setGenericCommand(c, ARGS_SET_NX, c->argv[1], c->argv[2], NULL, 0, shared.cone, shared.czero, NULL);
 }
 
 void setexCommand(client *c) {
-    c->argv[3] = tryObjectEncoding(c->argv[3]);
+    c->argv[3] = tryObjectEncodingForKeyedSet(c->argv[3]);
     setGenericCommand(c, ARGS_EX | ARGS_ARGV3, c->argv[1], c->argv[3], c->argv[2], UNIT_SECONDS, NULL, NULL, NULL);
 }
 
 void psetexCommand(client *c) {
-    c->argv[3] = tryObjectEncoding(c->argv[3]);
+    c->argv[3] = tryObjectEncodingForKeyedSet(c->argv[3]);
     setGenericCommand(c, ARGS_PX | ARGS_ARGV3, c->argv[1], c->argv[3], c->argv[2], UNIT_MILLISECONDS, NULL, NULL, NULL);
 }
 
@@ -450,7 +455,7 @@ void getdelCommand(client *c) {
 void getsetCommand(client *c) {
     initDeferredReplyBuffer(c);
     if (getGenericCommand(c) == C_ERR) return;
-    c->argv[2] = tryObjectEncoding(c->argv[2]);
+    c->argv[2] = tryObjectEncodingForKeyedSet(c->argv[2]);
     setKey(c, c->db, c->argv[1], &c->argv[2], 0);
     incrRefCount(c->argv[2]);
     notifyKeyspaceEvent(NOTIFY_STRING, "set", c->argv[1], c->db->id);
@@ -598,7 +603,7 @@ void msetGenericCommand(client *c, int nx) {
 
     int setkey_flags = nx ? SETKEY_DOESNT_EXIST : 0;
     for (j = 1; j < c->argc; j += 2) {
-        robj *val = tryObjectEncoding(c->argv[j + 1]);
+        robj *val = tryObjectEncodingForKeyedSet(c->argv[j + 1]);
         setKey(c, c->db, c->argv[j], &val, setkey_flags);
         incrRefCount(val);
         c->argv[j + 1] = val;
@@ -720,7 +725,7 @@ void appendCommand(client *c) {
     o = lookupKeyWrite(c->db, c->argv[1]);
     if (o == NULL) {
         /* Create the key */
-        c->argv[2] = tryObjectEncoding(c->argv[2]);
+        c->argv[2] = tryObjectEncodingForKeyedSet(c->argv[2]);
         dbAdd(c->db, c->argv[1], &c->argv[2]);
         incrRefCount(c->argv[2]);
         totlen = stringObjectLen(c->argv[2]);

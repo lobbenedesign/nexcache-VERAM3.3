@@ -953,6 +953,49 @@ robj *tryObjectEncoding(robj *o) {
     return tryObjectEncodingEx(o, 1);
 }
 
+/* NEX-PERF: like tryObjectEncoding(), but for callers that are about to
+ * attach a key to this value via setKey()/dbAdd()/dbSetValue() right
+ * after (SET, SETNX, SETEX, PSETEX, GETSET, MSET all call this, then
+ * immediately setKey() the same object). objectSetKeyAndExpire() (this
+ * file) always discards an EMBSTR-encoded object and builds a brand new,
+ * key-carrying one in its place -- embedding the value here, before the
+ * key is attached, just pays for an allocation and a decrRefCount() that
+ * get thrown away a few lines later. Confirmed with `sample`: for a
+ * short-value MSET-heavy workload this was the majority of the
+ * remaining (non-allocator) CPU cost after zmalloc_aligned() fixed the
+ * allocator side of the same hot path.
+ *
+ * Keeps the integer-encoding branch (shared/int-encoded values skip
+ * allocation entirely and are unaffected either way -- objectSetKeyAndExpire()
+ * doesn't special-case OBJ_ENCODING_INT, so there'd be nothing to save
+ * there anyway) and the SDS trim for values that end up staying RAW.
+ * Only skips the "convert short RAW string to EMBSTR" step. */
+robj *tryObjectEncodingForKeyedSet(robj *o) {
+    long value;
+    sds s;
+    size_t len;
+
+    if (!sdsEncodedObject(o)) return o;
+    if (o->refcount > 1) return o;
+
+    s = objectGetVal(o);
+    len = sdslen(s);
+    if (len <= 20 && string2l(s, len, &value)) {
+        if (o->encoding == OBJ_ENCODING_RAW) {
+            sdsfree(objectGetVal(o));
+            o->encoding = OBJ_ENCODING_INT;
+            o->ptr = (void *)value;
+            return o;
+        } else if (o->encoding == OBJ_ENCODING_EMBSTR) {
+            decrRefCount(o);
+            return createStringObjectFromLongLongForValue(value);
+        }
+    }
+
+    trimStringObjectIfNeeded(o, 0);
+    return o;
+}
+
 /* Get a decoded version of an encoded object (returned as a new object).
  * If the object is already raw-encoded just increment the ref count. */
 robj *getDecodedObject(robj *o) {
