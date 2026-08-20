@@ -4,7 +4,7 @@
 #include <assert.h>
 
 #define LRULFU_BITS 24
-#define OBJ_REFCOUNT_BITS 29
+#define OBJ_REFCOUNT_BITS 28
 
 struct serverObject {
     unsigned type : 4;
@@ -13,6 +13,7 @@ struct serverObject {
     unsigned hasexpire : 1;
     unsigned hasembkey : 1;
     unsigned hasembval : 1;
+    unsigned zallocaligned : 1;
     unsigned refcount : OBJ_REFCOUNT_BITS;
     void *ptr;
     char svi_payload[240];

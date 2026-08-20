@@ -814,7 +814,12 @@ typedef struct NexCacheModuleType moduleType;
 #define OBJ_ENCODING_STREAM 10    /* Encoded as a radix tree of listpacks */
 #define OBJ_ENCODING_LISTPACK 11  /* Encoded as a listpack */
 
-#define OBJ_REFCOUNT_BITS 29
+/* NEX-FIX: was 29, giving exactly 64 bits of flags+refcount with zero spare
+ * bits. Taking one bit for zallocaligned (see below) needs somewhere to
+ * come from without growing the (deliberately 256-byte) struct; refcount's
+ * ceiling drops from ~536M to ~268M, which no real object will ever get
+ * remotely close to. */
+#define OBJ_REFCOUNT_BITS 28
 #define OBJ_SHARED_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 1) /* Global object never destroyed. */
 #define OBJ_STATIC_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 2) /* Object allocated in the stack. */
 #define OBJ_FIRST_SPECIAL_REFCOUNT OBJ_STATIC_REFCOUNT
@@ -864,6 +869,18 @@ struct __attribute__((aligned(64))) serverObject {
     unsigned hasexpire : 1;
     unsigned hasembkey : 1;
     unsigned hasembval : 1;
+    /* NEX-FIX: which free() this object needs (RUBIN_MODE only) can't be
+     * read off hasembval -- objectUnembedVal() flips hasembval 1->0 in
+     * place on an object that keeps living in the same zcalloc()'d block
+     * it was created in, so "currently has an embedded value" and
+     * "originally came from the aligned allocator" are different
+     * questions. Set once at allocation time in
+     * createUnembeddedObjectWithKeyAndExpire()/
+     * createEmbeddedStringObjectWithKeyAndExpire() (object.c) and never
+     * touched again; decrRefCount(), objectComputeSize() (object.c) and
+     * the DEBUG SDSLEN handler (debug.c) key off this, not hasembval, to
+     * choose zfree_aligned()/zmalloc_size_aligned() vs the plain ones. */
+    unsigned zallocaligned : 1;
     unsigned refcount : OBJ_REFCOUNT_BITS;
     void *ptr; /* Use for large values or non-string types */
     char svi_payload[240]; /* SVI: In-place payload for 99% of GET/SET operations */

@@ -722,8 +722,19 @@ void debugCommand(client *c) {
             addReplyError(c, "Not an sds encoded string.");
         } else {
             /* Report the complete robj allocation size as the key's allocation
-             * size. Report 0 as allocation size for embedded values. */
+             * size. Report 0 as allocation size for embedded values.
+             * NEX-FIX: under RUBIN_MODE, objects with val->zallocaligned == 1
+             * are allocated via zmalloc_aligned() (object.c) and must be
+             * measured with zmalloc_size_aligned(), not zmalloc_size()/
+             * zmalloc_usable_size() directly -- see the allocation-site
+             * comment in createUnembeddedObjectWithKeyAndExpire(). Not
+             * keyed on hasembval; see the field comment on
+             * serverObject.zallocaligned in server.h for why. */
+#ifdef RUBIN_MODE
+            size_t obj_alloc = val->zallocaligned ? zmalloc_size_aligned(val) : zmalloc_usable_size(val);
+#else
             size_t obj_alloc = zmalloc_usable_size(val);
+#endif
             size_t val_alloc = val->encoding == OBJ_ENCODING_RAW ? sdsAllocSize(objectGetVal(val)) : 0;
             addReplyStatusFormat(c,
                                  "key_sds_len:%lld key_sds_avail:%lld obj_alloc:%lld "

@@ -429,6 +429,58 @@ void zfree(void *ptr) {
     zfree_internal(ptr, size);
 }
 
+/* NEX-FIX: fast substitute for posix_memalign() on the hot object-creation
+ * path (see createUnembeddedObjectWithKeyAndExpire() in object.c). The OS
+ * allocator's own aligned-alloc entry point has to search for (or carve
+ * out) a naturally-aligned block, which profiling showed costing several
+ * times more CPU than an ordinary small allocation -- and because every
+ * write command that creates a new key goes through it, that cost is
+ * clearly visible whenever many such allocations land back-to-back inside
+ * one atomic command (MSET, LPUSH on a new key, ...), where it can't be
+ * hidden by overlapping with other clients' I/O the way a single SET's
+ * cost can.
+ *
+ * Classic "over-allocate + round up + stash the real pointer" trick: get
+ * size + alignment - 1 + sizeof(void*) extra bytes from the ordinary (fast)
+ * allocator, round the returned address up to the requested alignment
+ * leaving room for a void* immediately before it, and store the original
+ * allocator-returned pointer there so zfree_aligned() can recover it.
+ * Because the actual allocation still goes through zmalloc()/zfree(),
+ * zmalloc's own accounting stays correct automatically -- no separate
+ * zmalloc_used_memory_add() bookkeeping needed, unlike the raw
+ * posix_memalign() this replaces.
+ *
+ * IMPORTANT: only call zfree_aligned()/zmalloc_size_aligned() on a
+ * pointer that actually came from zmalloc_aligned(). A caller that guesses
+ * wrong reads/frees garbage 8 bytes before whatever it was actually given
+ * -- this bit the object.c integration once already (via a stale
+ * o->hasembval check instead of the dedicated o->zallocaligned flag) and
+ * showed up as a heap-buffer-overflow read under AddressSanitizer. */
+void *zmalloc_aligned(size_t size, size_t alignment) {
+    assert((alignment & (alignment - 1)) == 0); /* must be a power of 2 */
+    void *raw = zmalloc(size + alignment - 1 + sizeof(void *));
+    uintptr_t aligned = ((uintptr_t)raw + sizeof(void *) + alignment - 1) & ~((uintptr_t)alignment - 1);
+    ((void **)aligned)[-1] = raw;
+    return (void *)aligned;
+}
+
+void zfree_aligned(void *ptr) {
+    if (ptr == NULL) return;
+    void *raw = ((void **)ptr)[-1];
+    zfree(raw);
+}
+
+/* A pointer returned by zmalloc_aligned() is not itself a malloc()-returned
+ * block start, so zmalloc_size(ptr) (which calls the platform's
+ * malloc_size()/malloc_usable_size()) is undefined on it. Recover the real
+ * allocator-returned pointer the same way zfree_aligned() does and measure
+ * that instead. */
+size_t zmalloc_size_aligned(void *ptr) {
+    if (ptr == NULL) return 0;
+    void *raw = ((void **)ptr)[-1];
+    return zmalloc_size(raw);
+}
+
 /* Like zfree(), but doesn't call zmalloc_size(). */
 void zfree_with_size(void *ptr, size_t size) {
     if (ptr == NULL) return;
