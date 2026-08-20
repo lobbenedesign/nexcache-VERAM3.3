@@ -75,37 +75,36 @@ static robj *createUnembeddedObjectWithKeyAndExpire(int type, void *val, const_s
     /* Allocate and set the declared fields. */
     size_t bufsize = 0;
 #ifdef RUBIN_MODE
-    robj *o;
     size_t alloc_size = ((min_size + 255) / 256) * 256;
-    /* NEX-FIX: this used raw posix_memalign()+memset() instead of zmalloc,
-     * to get the 256-byte "Olympus cache line" alignment SVI relies on.
-     * zmalloc has no aligned-alloc entry point, so bypassing it seemed
-     * harmless -- but every object created here (any string with an
-     * embedded key, i.e. essentially every key once it has a name and,
-     * per shouldEmbedStringObject() above, especially once it also has a
-     * TTL) is later released the ordinary way: decrRefCount() -> zfree(o).
-     * zfree() reads the real block size straight from the allocator
-     * (zmalloc_size() -> malloc_size()/malloc_usable_size(), which works
-     * fine on a posix_memalign'd pointer) and subtracts it from the
-     * zmalloc-tracked counter -- the same counter this allocation never
-     * added to. Every TTL'd SET/SETEX/EXPIRE-family write therefore drains
-     * "used_memory" by ~256-512 bytes it never accounted for gaining, so
-     * INFO's used_memory (and getMaxmemoryState()/performEvictions(), which
-     * read the exact same counter) drift further from real usage the more
-     * such keys are written -- confirmed by instrumenting update_zmalloc_
-     * stat_alloc/free directly: this call site's allocations never fired
-     * the alloc hook, but the matching zfree() always fired the free hook,
-     * with sizes matching exactly. In production this is why maxmemory
-     * eviction on this build effectively never triggers for real workloads
-     * (unit/maxmemory.tcl's "is the memory limit honoured?" tests reproduce
-     * it directly), and given enough churn the tracked counter can underflow
-     * a size_t entirely. Keep the raw posix_memalign (it's the only way to
-     * get 256-byte alignment) but register it with zmalloc's own tracker so
-     * the later zfree() has a matching credit, the same way zmalloc's other
-     * allocation paths always keep update_zmalloc_stat_alloc/free paired. */
-    if (posix_memalign((void**)&o, 256, alloc_size) != 0) return NULL;
+    /* NEX-FIX: this used raw posix_memalign() to get the 256-byte "Olympus
+     * cache line" alignment SVI relies on. zmalloc had no aligned-alloc
+     * entry point, so a prior fix here kept the raw posix_memalign() and
+     * separately registered its size with zmalloc's tracker
+     * (zmalloc_used_memory_add()) to fix a memory-accounting drift, but
+     * left the real problem untouched: posix_memalign() itself is
+     * expensive (it has to search for or carve out a naturally-aligned
+     * block) compared to an ordinary small allocation, and this function
+     * creates essentially every robj in the server (createObject() is a
+     * thin wrapper over this one -- see below). Profiling a MSET/LPUSH-
+     * heavy workload showed the majority of CPU time in setKey() going into
+     * this allocation; the cost is normally absorbed by connection-level
+     * concurrency for a single SET, but is fully exposed (and additive)
+     * when several such allocations happen back-to-back inside one atomic
+     * multi-key command.
+     *
+     * zmalloc_aligned()/zfree_aligned() (zmalloc.c) get the same alignment
+     * via the ordinary fast allocator (over-allocate, round up, stash the
+     * real pointer) instead of the OS's aligned-alloc path, and route
+     * through zmalloc()/zfree() internally, so zmalloc's own accounting
+     * stays correct automatically -- no separate zmalloc_used_memory_add()
+     * needed any more. The paired free lives in decrRefCount() (object.c),
+     * gated on o->hasembval: objects allocated here always have
+     * hasembval == 0 (set below), while the only other robj constructor,
+     * createEmbeddedStringObjectWithKeyAndExpire(), always sets
+     * hasembval == 1 and allocates via plain zcalloc(), needing plain
+     * zfree(). */
+    robj *o = zmalloc_aligned(alloc_size, 256);
     memset(o, 0, alloc_size);
-    zmalloc_used_memory_add(alloc_size);
     bufsize = alloc_size;
 #else
     robj *o = zcalloc_usable(min_size, &bufsize);
@@ -651,7 +650,22 @@ void decrRefCount(robj *o) {
             default: serverPanic("Unknown object type"); break;
             }
         }
+#ifdef RUBIN_MODE
+        /* NEX-FIX: objects from createUnembeddedObjectWithKeyAndExpire()
+         * (hasembval == 0) are allocated with zmalloc_aligned() under
+         * RUBIN_MODE and must be freed with the matching zfree_aligned();
+         * objects from createEmbeddedStringObjectWithKeyAndExpire()
+         * (hasembval == 1) are plain zcalloc() and need plain zfree(). See
+         * the allocation-site comment in createUnembeddedObjectWithKeyAndExpire()
+         * (above in this file) for why. */
+        if (o->hasembval) {
+            zfree(o);
+        } else {
+            zfree_aligned(o);
+        }
+#else
         zfree(o);
+#endif
     } else {
         if (o->refcount <= 0) serverPanic("decrRefCount against refcount <= 0");
         if (o->refcount != OBJ_SHARED_REFCOUNT) o->refcount--;
@@ -1206,7 +1220,16 @@ char *strEncoding(int encoding) {
 #define OBJ_COMPUTE_SIZE_DEF_SAMPLES 5 /* Default sample size. */
 size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
     size_t elesize = 0, samples = 0;
+    /* NEX-FIX: objects from createUnembeddedObjectWithKeyAndExpire()
+     * (hasembval == 0) are allocated via zmalloc_aligned() under
+     * RUBIN_MODE, so measuring them needs zmalloc_size_aligned() -- see
+     * the allocation-site comment there and decrRefCount()'s matching
+     * free-side dispatch. */
+#ifdef RUBIN_MODE
+    size_t asize = o->hasembval ? zmalloc_size((void *)o) : zmalloc_size_aligned((void *)o);
+#else
     size_t asize = zmalloc_size((void *)o);
+#endif
 
     if (o->type == OBJ_STRING) {
         if (o->encoding == OBJ_ENCODING_RAW) {
