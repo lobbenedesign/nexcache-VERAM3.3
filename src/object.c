@@ -246,9 +246,42 @@ static robj *createEmbeddedStringObject(const char *ptr, size_t len) {
 
 static bool shouldEmbedStringObject(size_t val_len, const_sds key, long long expire) {
 #ifdef RUBIN_MODE
-    /* NEX-VERA: Support SVI up to 240 bytes in-situ. For now, only for values. */
-    if (key || expire != EXPIRY_NONE) return false;
-    return val_len <= (240 - sdsHdrSize(SDS_TYPE_8) - 1);
+    /* NEX-VERA: Support SVI up to 240 bytes in-situ, for the value alone or
+     * for key + expire + value together -- createEmbeddedStringObjectWithKeyAndExpire()
+     * (above) already builds that combined layout correctly and every
+     * accessor (objectGetVal/objectGetKey/objectGetExpire) already reads it
+     * back generically regardless of which fields are present, so nothing
+     * downstream needs to change to support this.
+     *
+     * This used to unconditionally return false whenever a key was being
+     * attached ("if (key || expire != EXPIRY_NONE) return false"), which
+     * mattered because objectSetKeyAndExpire() -- the function every write
+     * command's setKey() funnels through -- is called with a real key on
+     * essentially every SET. That made the combined-embed path dead code
+     * for the single most common operation on the server: a value arriving
+     * from the RESP parser (createStringObject() embeds short values
+     * unconditionally, see networking.c's parseMultibulkBuffer) would get
+     * un-embedded again a few lines later in objectSetKeyAndExpire() --
+     * duplicating the value's sds (sdsnewlen) and allocating a fresh
+     * 256-byte-aligned robj -- immediately after having just been embedded
+     * once already. Net cost per SET: 2 extra allocations (the throwaway
+     * EMBSTR robj, the value's sds duplicate) plus 1 extra free, on top of
+     * the one allocation that was actually needed. Measured via `sample`:
+     * this was the majority of the non-allocator CPU cost on the SET path
+     * after the allocator itself was fixed (zmalloc_aligned()).
+     *
+     * dbSetValue()'s in-place pointer-swap fast path already excludes any
+     * OBJ_ENCODING_EMBSTR object (old->encoding != OBJ_ENCODING_EMBSTR),
+     * which createEmbeddedStringObjectWithKeyAndExpire() always sets
+     * (encoding = OBJ_ENCODING_EMBSTR unconditionally), so this doesn't
+     * interact badly with that path -- it just means such an object always
+     * takes dbSetValue()'s (still single-allocation) slow path, which is
+     * exactly what already happened for every embedded value before this
+     * change, key or no key. */
+    size_t needed = sdsHdrSize(SDS_TYPE_8) + val_len + 1;
+    if (expire != EXPIRY_NONE) needed += sizeof(long long);
+    if (key) needed += (size_t)1 + sdsHdrSize(SDS_TYPE_8) + sdslen(key) + 1;
+    return needed <= 240;
 #else
     /* Standard Redis logic */
     if (val_len > sdsTypeMaxSize(SDS_TYPE_8)) return false;
