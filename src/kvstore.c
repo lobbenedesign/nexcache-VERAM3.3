@@ -924,6 +924,21 @@ void **kvstoreHashtableFindRef(kvstore *kvs, int didx, const void *key) {
     return ret;
 }
 
+bool kvstoreHashtableFindAndCopy(kvstore *kvs, int didx, const void *key,
+                                 void (*copy_cb)(void *entry, void *ctx), void *ctx) {
+    pthread_mutex_lock(&kvs->locks[didx]);
+    hashtable *ht = kvstoreGetHashtable(kvs, didx);
+    if (!ht) {
+        pthread_mutex_unlock(&kvs->locks[didx]);
+        return false;
+    }
+    void *found = NULL;
+    bool ret = hashtableFind(ht, key, &found);
+    if (ret) copy_cb(found, ctx);
+    pthread_mutex_unlock(&kvs->locks[didx]);
+    return ret;
+}
+
 bool kvstoreHashtableAdd(kvstore *kvs, int didx, void *entry) {
     pthread_mutex_lock(&kvs->locks[didx]);
     hashtable *ht = createHashtableIfNeeded(kvs, didx);

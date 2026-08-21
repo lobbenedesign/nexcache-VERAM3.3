@@ -84,6 +84,20 @@ unsigned long kvstoreHashtableScanDefrag(kvstore *kvs,
 unsigned long kvstoreHashtableDefragTables(kvstore *kvs, unsigned long cursor, void *(*defragfn)(void *));
 bool kvstoreHashtableFind(kvstore *kvs, int didx, void *key, void **found);
 void **kvstoreHashtableFindRef(kvstore *kvs, int didx, const void *key);
+
+/* Like kvstoreHashtableFind(), but invokes copy_cb(found_entry, ctx) WHILE
+ * kvs->locks[didx] is still held, instead of handing the raw entry pointer
+ * back to the caller after unlocking. kvstoreHashtableFind()/FindRef() only
+ * protect the bucket lookup itself -- the returned pointer can be freed by a
+ * concurrent writer on the same shard the instant the lock is released, so
+ * they are only safe for callers that never run concurrently with a writer
+ * on that shard (true today, since the whole server is single-threaded).
+ * This variant is for callers that WILL run on a different thread than
+ * writers: copy_cb must copy out whatever it needs (e.g. value bytes) and
+ * must not retain the entry pointer past its own return. Returns true if the
+ * key was found (and copy_cb was called), false otherwise. */
+bool kvstoreHashtableFindAndCopy(kvstore *kvs, int didx, const void *key,
+                                 void (*copy_cb)(void *entry, void *ctx), void *ctx);
 bool kvstoreHashtableAdd(kvstore *kvs, int didx, void *entry);
 
 bool kvstoreHashtableFindPositionForInsert(kvstore *kvs, int didx, void *key, hashtablePosition *position, void **existing);

@@ -85,6 +85,15 @@ if [ "$TSAN_ONLY" -eq 0 ]; then
         "$SRC/core/nexstorage.o" "$SRC/core/vll.o" "$SRC/hashtable/nexdash.o" \
         "$SRC/bloom/nexbloom.o" "$SRC/memory/arena.o" "$SRC/segcache/segcache.o" \
         "$SRC/flash/flash.o" "$SRC/macos_stubs.o"
+
+    # test_shard_parallel_read: prototipo Fase 1 del piano "motore multi-thread
+    # reale" -- misura se il kvstore scala con letture concorrenti multi-thread
+    # usando kvstoreHashtableFindAndCopy() (variante che tiene il lock per-shard
+    # per l'intera durata find+copia, sicura per uso cross-thread). Non tocca
+    # alcun path client-facing: e' un harness isolato su kvstore.c cosi' com'e'.
+    build_and_run test_shard_parallel_read tests/test_shard_parallel_read_20260821.c \
+        "$SRC/kvstore.o" "$SRC/hashtable.o" "$SRC/adlist.o" "$SRC/zmalloc.o" \
+        "$SRC/monotonic.o" "$SRC/serverassert.o" "$SRC/siphash.o" "$SRC/mt19937-64.o"
 fi
 
 # ── Build TSan della suite di concorrenza (dal sorgente, non dai .o:
@@ -103,6 +112,20 @@ else
     echo "  BUILD FAILED — vedi $BUILD/test_concurrency_tsan.build.log"
     FAIL=$((FAIL + 1))
     FAILED_NAMES+=("test_concurrency_tsan (build)")
+fi
+
+echo ""
+echo "[build] test_shard_parallel_read_tsan (ThreadSanitizer)"
+if clang -O1 -g -fsanitize=thread -o "$BUILD/test_shard_parallel_read_tsan" \
+    tests/test_shard_parallel_read_20260821.c \
+    "$SRC/kvstore.c" "$SRC/hashtable.c" "$SRC/adlist.c" "$SRC/zmalloc.c" \
+    "$SRC/monotonic.c" "$SRC/serverassert.c" "$SRC/siphash.c" "$SRC/mt19937-64.c" \
+    -I "$SRC" -lpthread -lm 2>"$BUILD/test_shard_parallel_read_tsan.build.log"; then
+    TSAN_OPTIONS="halt_on_error=0" run_one test_shard_parallel_read_tsan
+else
+    echo "  BUILD FAILED — vedi $BUILD/test_shard_parallel_read_tsan.build.log"
+    FAIL=$((FAIL + 1))
+    FAILED_NAMES+=("test_shard_parallel_read_tsan (build)")
 fi
 
 echo ""
