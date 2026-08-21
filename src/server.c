@@ -3236,9 +3236,23 @@ void InitServerLast(void) {
     server.initial_memory_usage = zmalloc_used_memory() - mh->overhead_total;
     freeMemoryOverheadData(mh);
 
-    /* G3-GODMODE: Initialize the sharded engine (Auto-detect for M1 / Force 176 for Rubin) */
+    /* Initialize the sharded engine structure. We always CREATE it, because
+     * g_engine->vll is the Virtual Lock Layer used by EXEC in multi.c, but we
+     * only START its worker threads when explicitly asked for via the
+     * nex-engine-workers config (default: off).
+     *
+     * Rationale: engine_dispatch_cmd() — the only function that ever enqueues
+     * work onto a worker's cmd_queue — has no callers anywhere in the tree, so
+     * the workers' queues are permanently empty and they process exactly zero
+     * commands. Meanwhile worker_thread_main() busy-polls (spin loop whose
+     * decay floors at 500 iterations, followed by a 50ns nanosleep), which
+     * measured ~350% CPU on an otherwise completely idle server. That is ~3.6
+     * cores stolen from the single-threaded event loop that actually serves all
+     * RESP traffic, and it is the dominant reason throughput collapsed under
+     * CPU-bound (deeply pipelined) load. Note engine_create() maps 0 to
+     * "auto-detect" (8 workers), so passing 0 here never meant "disabled". */
     NexEngine *engine = engine_create(0, server.port + 1000, NULL);
-    if (engine) engine_start(engine);
+    if (engine && server.nex_engine_workers) engine_start(engine);
 }
 
 /* The purpose of this function is to try to "glue" consecutive range
