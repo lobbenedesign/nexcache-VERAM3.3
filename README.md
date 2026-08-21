@@ -28,11 +28,29 @@ Questo progetto introduce innovazioni critiche nel kernel di NexCache:
 *   **SVE2 Vectorized Parsing:** Il parsing del protocollo RESP è accelerato tramite istruzioni ARM SVE2, processando multipli delimitatori simultaneamente in un unico ciclo di clock.
 *   **SVI (Small-Value Inlining):** Per valori piccoli, i dati vengono inlined direttamente nell'oggetto (serverObject), riducendo le dereferenziazioni di puntatori e migliorando il cache hit rate.
 
-### Performance: confronto locale con i competitor
+### Performance: confronto con i competitor
+
+**Aggiornamento**: una sessione successiva ha trovato e corretto un bug reale — 8 thread "worker" di un motore multi-thread mai completato (`core/engine.c`) giravano in busy-spin permanente, consumando ~350% di CPU **anche a server completamente inattivo**, pur non elaborando mai un solo comando (verificato: la funzione che avrebbe dovuto instradare lavoro verso quei thread non aveva alcun chiamante in tutto il codebase). Su una macchina condivisa, questo penalizzava **anche** le misure di Redis/Garnet nello stesso confronto, non solo NexCache — i numeri della tabella precedente (in fondo a questa sezione, mantenuti per trasparenza) erano quindi falsati, non solo pessimistici. Disattivarli ha dato **+59,9%** di throughput da solo; un secondo fix (embedding SVI chiave+valore, prima solo valore) ha aggiunto un altro **+7,2%**.
+
+Nuova misura, dopo i fix, su ambiente riproducibile: GitHub Actions (`ubuntu-22.04`), Redis **8.0.1 compilato da sorgente** (l'apt di Ubuntu 22.04 offre solo 6.0.16), `redis-benchmark` con la stessa metodologia di prima (200.000 richieste, 50 connessioni, valori da 32 byte, nessun pipelining).
+
+| Workload | Redis 8.0.1 | NexCache VERAM3.3 |
+|---|---|---|
+| SET puro (ops/sec) | 54.810 | 55.571 (**101%**) |
+| GET puro a caldo (ops/sec) | 55.249 | 55.325 (**100%**) |
+| Latenza p50 SET (ms) | 0,447 | 0,447–0,455 |
+| Latenza p50 GET (ms) | 0,447 | 0,447 |
+
+**Nota metodologica, per onestà**: anche i runner di GitHub Actions sono macchine virtuali cloud condivise, non hardware dedicato — non il picco teorico assoluto, ma un ambiente riproducibile e uguale per entrambi i server nello stesso momento (a differenza della vecchia misura macOS, qui non c'è più l'asimmetria di rumore descritta sopra). **Sotto pipeline profonda** (molti comandi in sequenza senza attendere risposta, che espone il costo per-operazione invece della latenza di rete) il divario reale emerge: NexCache è al 62-64% di Redis sul SET e al 76-82% sul GET — l'oggetto di lavoro futuro documentato in [issue #1](https://github.com/lobbenedesign/nexcache-VERAM3.3/issues/1).
+
+I numeri Garnet non sono stati ri-misurati in questa sessione (richiede un SDK .NET non disponibile sull'ambiente di test); la tabella storica sotto resta come riferimento ma va considerata superata per la colonna NexCache.
+
+<details>
+<summary>Misura storica (macOS, prima dei fix — mantenuta per trasparenza)</summary>
 
 Misurato con `redis-benchmark` (200.000 richieste, 50 connessioni, valori da 32 byte, keyspace caldo per i GET) contro Redis 8.0.1 e Microsoft Garnet, un server alla volta sulla stessa macchina di sviluppo (macOS ARM64, Apple Silicon).
 
-**Nota metodologica importante, per onestà**: questa non è una macchina da benchmark dedicata — è la mia macchina di sviluppo quotidiana, con altre applicazioni attive durante la misura (load average ~7-8 su rilevazioni multiple). I numeri assoluti vanno quindi letti come **indicativi**, non come picco teorico. È stato osservato che VERAM3.3 è più sensibile al rumore di sistema rispetto a Redis e Garnet (varianza fino al 30% tra run consecutivi, vs <15% per gli altri due) — probabilmente per via del polling attivo dei suoi thread I/O, che compete più direttamente per CPU quando la macchina è già sotto carico. È un limite noto, non nascosto: su una macchina realmente dedicata i numeri per VERAM3.3 sarebbero probabilmente più alti e più stabili.
+**Nota metodologica importante, per onestà**: questa non è una macchina da benchmark dedicata — è la mia macchina di sviluppo quotidiana, con altre applicazioni attive durante la misura (load average ~7-8 su rilevazioni multiple). I numeri assoluti vanno quindi letti come **indicativi**, non come picco teorico. È stato osservato che VERAM3.3 è più sensibile al rumore di sistema rispetto a Redis e Garnet (varianza fino al 30% tra run consecutivi, vs <15% per gli altri due) — poi scoperto essere in gran parte dovuto al bug degli 8 thread parassiti descritto sopra, non (solo) al polling dei thread I/O legittimi.
 
 | Workload | Redis 8.0.1 | Garnet | NexCache VERAM3.3 |
 |---|---|---|---|
@@ -41,7 +59,7 @@ Misurato con `redis-benchmark` (200.000 richieste, 50 connessioni, valori da 32 
 | Latenza p50 SET (ms) | 0,223 | 0,239 | 0,799–0,831 |
 | Latenza p50 GET (ms) | 0,247 | 0,239 | 0,687 |
 
-**Lettura onesta**: su questa macchina, in queste condizioni, Redis e Garnet vanno testa a testa; VERAM3.3 è più lento su entrambi i workload puri. Il fast-path Garnet-style sul GET (i thread I/O rispondono direttamente da NexStorage, bypassando il thread principale) restringe il divario sul GET rispetto al SET, ma non lo elimina in queste condizioni di carico. Il vantaggio architetturale reale di VERAM3.3 emerge sui workload misti realistici grazie alla combinazione fast-path GET + sharding a 176 vie, ma non è stato ri-misurato in questa sessione — da verificare in un prossimo giro con macchina a riposo.
+</details>
 
 ### Architettura: differenze e similitudini con i competitor
 
@@ -85,11 +103,29 @@ This project introduces critical innovations into the NexCache kernel:
 *   **SVE2 Vectorized Parsing:** RESP protocol parsing is accelerated via ARM SVE2 instructions, processing multiple delimiters simultaneously in a single clock cycle.
 *   **SVI (Small-Value Inlining):** For small values, data is inlined directly within the object (serverObject), reducing pointer dereferencing and improving cache hit rates.
 
-### Performance: local comparison against competitors
+### Performance: comparison against competitors
+
+**Update**: a later session found and fixed a real bug — 8 "worker" threads belonging to a never-finished multi-thread engine (`core/engine.c`) were permanently busy-spinning, burning ~350% CPU **even on a completely idle server**, while never actually processing a single command (verified: the function meant to dispatch work to them had no callers anywhere in the codebase). On a shared machine, this also penalized the Redis/Garnet measurements in the same comparison, not just NexCache's — the table further down (kept for transparency) was therefore skewed, not just pessimistic. Disabling them alone gave **+59.9%** throughput; a second fix (embedding key+value together in SVI, instead of value only) added another **+7.2%**.
+
+New measurement, after the fixes, on a reproducible environment: GitHub Actions (`ubuntu-22.04`), Redis **8.0.1 built from source** (Ubuntu 22.04's apt package is only 6.0.16), `redis-benchmark` with the same methodology as before (200,000 requests, 50 connections, 32-byte values, no pipelining).
+
+| Workload | Redis 8.0.1 | NexCache VERAM3.3 |
+|---|---|---|
+| SET-only (ops/sec) | 54,810 | 55,571 (**101%**) |
+| GET-only, warm (ops/sec) | 55,249 | 55,325 (**100%**) |
+| SET p50 latency (ms) | 0.447 | 0.447–0.455 |
+| GET p50 latency (ms) | 0.447 | 0.447 |
+
+**Methodology note, for honesty's sake**: GitHub Actions runners are also shared cloud VMs, not dedicated hardware -- not the absolute theoretical peak, but a reproducible environment, identical for both servers at the same time (unlike the old macOS measurement, there's no longer the noise asymmetry described below). **Under deep pipelining** (many commands back-to-back with no wait for a reply, which exposes per-operation cost rather than network latency) the real gap shows up: NexCache is at 62-64% of Redis on SET and 76-82% on GET -- tracked as future work in [issue #1](https://github.com/lobbenedesign/nexcache-VERAM3.3/issues/1).
+
+Garnet numbers were not re-measured in this session (needs a .NET SDK not available in the test environment); the historical table below is kept as a reference but should be considered superseded for the NexCache column.
+
+<details>
+<summary>Historical measurement (macOS, before the fixes -- kept for transparency)</summary>
 
 Measured with `redis-benchmark` (200,000 requests, 50 connections, 32-byte values, warm keyspace for GETs) against Redis 8.0.1 and Microsoft Garnet, one server at a time on the same development machine (macOS ARM64, Apple Silicon).
 
-**Important methodology note, for honesty's sake**: this is not a dedicated benchmark rig — it's my everyday development machine, with other applications running during the measurement (load average ~7-8 across multiple checks). The absolute numbers should be read as **indicative**, not a theoretical ceiling. VERAM3.3 was observed to be more sensitive to system noise than Redis and Garnet (up to 30% variance between consecutive runs, vs <15% for the other two) — likely because its I/O threads' active polling competes more directly for CPU when the machine is already under load. This is a known, disclosed limitation, not a hidden one — on a genuinely dedicated machine, VERAM3.3's numbers would likely be higher and more stable.
+**Important methodology note, for honesty's sake**: this is not a dedicated benchmark rig — it's my everyday development machine, with other applications running during the measurement (load average ~7-8 across multiple checks). The absolute numbers should be read as **indicative**, not a theoretical ceiling. VERAM3.3 was observed to be more sensitive to system noise than Redis and Garnet (up to 30% variance between consecutive runs, vs <15% for the other two) — later found to be largely caused by the 8 parasitic threads bug described above, not (only) legitimate I/O-thread polling.
 
 | Workload | Redis 8.0.1 | Garnet | NexCache VERAM3.3 |
 |---|---|---|---|
@@ -98,7 +134,7 @@ Measured with `redis-benchmark` (200,000 requests, 50 connections, 32-byte value
 | SET p50 latency (ms) | 0.223 | 0.239 | 0.799–0.831 |
 | GET p50 latency (ms) | 0.247 | 0.239 | 0.687 |
 
-**Honest read**: on this machine, under these conditions, Redis and Garnet are neck and neck; VERAM3.3 is slower on both pure workloads. The Garnet-style GET fast-path (I/O threads answer directly from NexStorage, bypassing the main thread) narrows the gap on GET relative to SET, but doesn't close it under this load. VERAM3.3's real architectural edge is expected to show up on realistic mixed workloads thanks to the combination of the GET fast-path and 176-way sharding, but that wasn't re-measured in this session — worth verifying in a future pass with the machine at rest.
+</details>
 
 ### Architecture: differences and similarities with competitors
 
